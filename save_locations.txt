@@ -1458,3 +1458,4 @@ Zuma's Revenge, [programdata]\AtomShockwave\ZumasRevenge\
 Zuma's Revenge, [programdata]\PopCap Games\ZumasRevenge\
 Zuma's Revenge, [programdata]\Steam\ZumasRevenge\
 Zuma's Revenge, [programdata]\WildTangent\ZumasRevenge
+Mahou Tsukai no Yoru, D:\Games\WITCH ON THE HOLY NIGHT\UserData

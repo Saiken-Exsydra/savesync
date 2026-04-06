@@ -60,6 +60,11 @@ log = logging.getLogger("savesync")
 # Terminal helpers
 # ---------------------------------------------------------------
 
+def resize_terminal():
+    """Resize the terminal window to a comfortable size on Windows."""
+    if os.name == "nt":
+        os.system("mode con: cols=80 lines=40")
+
 def clear():
     os.system("cls" if os.name == "nt" else "clear")
 
@@ -72,11 +77,10 @@ def header(title=""):
     print("  ░█▀▀░█▀█░█░█░█▀▀░░░█▀▀░█░█░█▀█░█▀▀")
     print("  ░▀▀█░█▀█░▀▄▀░█▀▀░░░▀▀█░░█░░█░█░█░░")
     print("  ░▀▀▀░▀░▀░░▀░░▀▀▀░░░▀▀▀░░▀░░▀░▀░▀▀▀")
-    hr()
+    print()
     if title:
         print(f"  {title}")
-        hr()
-    print()
+        print()
 
 def pause(msg="  Press Enter to continue..."):
     input(msg)
@@ -98,7 +102,7 @@ def progress(pct: int, msg: str):
 
 def now_iso() -> str:
     """Current UTC time as an ISO 8601 string."""
-    return datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def fmt_ts(iso: str) -> str:
     """Format an ISO timestamp for display: '01 Apr 2025 at 14:32 UTC'"""
@@ -308,34 +312,54 @@ def manifest_db_age() -> str:
 
 def search_manifest(game_name: str) -> list:
     """Search the index for a game. Returns list of (display_name, [paths]) tuples.
-    Tries exact match first, then partial matches."""
+    Priority: exact > all words matched > most words matched > partial substring."""
     index = load_manifest_index()
     if not index:
         return []
 
-    query = game_name.lower().strip()
+    query       = game_name.lower().strip()
+    query_words = query.split()
 
-    # 1. Exact match
+    # 1. Exact match — highest priority, return immediately
     if query in index:
         entry = index[query]
         return [(entry["name"], entry["paths"])]
 
-    # 2. Partial matches — query contained in key or key contained in query
-    matches = []
+    scored = []
     for key, entry in index.items():
+        key_words = key.split()
+
+        # Count how many query words appear in the key
+        words_matched = sum(1 for w in query_words if w in key_words)
+
+        # Skip entries that share zero words with the query
+        if words_matched == 0:
+            continue
+
+        # Bonus: all words matched
+        all_matched = words_matched == len(query_words)
+
+        # Penalty: how different the total length is
+        length_diff = abs(len(key) - len(query))
+
+        # Score: more words matched = better, fewer length difference = better
+        # Multiply words_matched heavily so a 4-word match always beats a 1-word match
+        score = (words_matched * 100) - length_diff
+
+        # Extra boost if the full query string is a substring of the key or vice versa
         if query in key or key in query:
-            matches.append((entry["name"], entry["paths"]))
+            score += 50
 
-    # 3. Word-level matches — all words in query appear in the key
-    if not matches:
-        words = query.split()
-        for key, entry in index.items():
-            if all(w in key for w in words):
-                matches.append((entry["name"], entry["paths"]))
+        scored.append((score, all_matched, entry["name"], entry["paths"]))
 
-    # Sort by closeness (shorter name length difference = better match)
-    matches.sort(key=lambda x: abs(len(x[0]) - len(game_name)))
-    return matches[:8]  # cap at 8 results
+    if not scored:
+        return []
+
+    # Sort by score descending
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    # Return top 8
+    return [(name, paths) for _, _, name, paths in scored[:8]]
 
 
 def ensure_manifest_ready(silent=False) -> bool:
@@ -688,14 +712,25 @@ def _notify_after_backup(game: dict):
     time.sleep(2)  # small delay to let the game fully release file locks
     ok = run_backup(game, reason="game closed", silent=True)
     if ok:
-        notify("Saves backed up", f"{game['name']} — saves backed up successfully.")
+        notify(
+            "Backup complete",
+            f"{game['name']} — save files backed up successfully."
+        )
     else:
-        notify("Backup failed", f"{game['name']} — backup failed. Open SaveSync to diagnose.")
+        notify(
+            "Backup failed",
+            f"{game['name']} — something went wrong during backup. "
+            f"Check your internet connection and open SaveSync to diagnose."
+        )
 
 
 class GameWatcher(threading.Thread):
     def __init__(self, games):
         super().__init__(daemon=True)
+        # Support old entries that only have exe_path — derive exe_name from it
+        for g in games:
+            if not g.get("exe_name") and g.get("exe_path"):
+                g["exe_name"] = Path(g["exe_path"]).name
         self.games = {g["exe_name"].lower(): g for g in games if g.get("exe_name")}
         self.running_pids = {}
         self._stop = threading.Event()
@@ -717,8 +752,14 @@ class GameWatcher(threading.Thread):
                 if exe not in self.running_pids:
                     self.running_pids[exe] = pid
                     g = self.games[exe]
+                    # Instant notification the moment the process is seen —
+                    # fires before backup so user knows immediately SaveSync caught it
+                    notify(
+                        "SaveSync — Watcher online",
+                        f"{g['name']} detected. Saves are being watched."
+                    )
+                    log.info(f"[{g['name']}] process detected: {exe}")
                     if g.get("trigger_launch"):
-                        notify("Game detected", f"{g['name']} is open — backing up saves...")
                         threading.Thread(
                             target=run_backup, args=(g, "game launched", True), daemon=True
                         ).start()
@@ -727,6 +768,12 @@ class GameWatcher(threading.Thread):
                     g = self.games[exe]
                     del self.running_pids[exe]
                     if g.get("trigger_close"):
+                        # Instant notification — fires the moment the process disappears
+                        notify(
+                            "Game closed — backup starting",
+                            f"{g['name']} closed. Backing up your save files now..."
+                        )
+                        log.info(f"[{g['name']}] process closed, backup starting")
                         threading.Thread(
                             target=_notify_after_backup, args=(g,), daemon=True
                         ).start()
@@ -774,18 +821,16 @@ def write_launcher(game: dict):
 def screen_main():
     while True:
         header()
-        print("  Main Menu\n")
         print("    1.  Add a game")
-        print("    2.  List games")
+        print("    2.  My games")
         print("    3.  Remove a game")
-        print("    4.  Backup a game now")
-        print("    5.  Start background watcher")
-        print("    6.  Google Drive setup")
-        print("    7.  Restore saves from Drive")
-        print("    8.  Create launcher for a game")
-        print("    9.  Install watcher as Windows startup task")
-        print("   10.  Integrity check")
-        print("   11.  Game database")
+        print("    4.  Health check")
+        print()
+        print("    5.  Backup now")
+        print("    6.  Restore from Drive")
+        print()
+        print("    7.  Watcher")
+        print("    8.  Settings")
         print()
         print("    0.  Exit")
         print()
@@ -798,21 +843,15 @@ def screen_main():
         elif choice == "3":
             screen_remove_game()
         elif choice == "4":
-            screen_backup_now()
-        elif choice == "5":
-            screen_watch()
-        elif choice == "6":
-            screen_drive_setup()
-        elif choice == "7":
-            screen_restore_from_drive()
-        elif choice == "8":
-            screen_create_launcher()
-        elif choice == "9":
-            screen_install_startup()
-        elif choice == "10":
             screen_integrity_check()
-        elif choice == "11":
-            screen_game_database()
+        elif choice == "5":
+            screen_backup_now()
+        elif choice == "6":
+            screen_restore_from_drive()
+        elif choice == "7":
+            screen_watcher_setup()
+        elif choice == "8":
+            screen_settings()
         elif choice == "0":
             clear()
             print("\n  Goodbye!\n")
@@ -820,6 +859,194 @@ def screen_main():
         else:
             print("\n  Invalid option. Try again.")
             time.sleep(1)
+
+
+
+
+
+# ---------------------------------------------------------------
+
+def screen_watcher_setup():
+    while True:
+        header("Watcher")
+
+        import subprocess
+        check = subprocess.run(
+            ["schtasks", "/query", "/tn", "SaveSyncWatcher"],
+            capture_output=True
+        )
+        task_installed = check.returncode == 0
+
+        print("  The watcher runs silently in the background and monitors")
+        print("  your registered games. The moment it sees a game open,")
+        print("  it backs up your saves. When the game closes, it backs")
+        print("  up again. You never have to do anything manually.")
+        print()
+        if task_installed:
+            print("  Status  Windows startup task is installed and active.")
+        else:
+            print("  Status  Not running at startup.")
+        print()
+        print("    1.  Start now")
+        print("        Runs in this window. Stops when you close it.")
+        print()
+        print("    2.  Install on Windows startup")
+        print("        Starts silently every time you log into Windows.")
+        print("        No window. No manual steps. Fully automatic.")
+        print()
+        print("    3.  Remove from Windows startup")
+        print("        Uninstalls the startup task if you no longer")
+        print("        want the watcher running automatically.")
+        print()
+        print("    0.  Back")
+        print()
+        choice = input("  > ").strip()
+
+        if choice == "1":
+            screen_watch()
+        elif choice == "2":
+            screen_install_startup(mode="install")
+        elif choice == "3":
+            screen_install_startup(mode="remove")
+        elif choice == "0":
+            return
+        else:
+            print("\n  Invalid option.")
+            time.sleep(1)
+
+
+
+# ---------------------------------------------------------------
+
+def _install_startup_task():
+    import platform
+    import subprocess
+
+    header("Install Windows Startup Task")
+    print("  This registers SaveSync's watcher as a Windows Task Scheduler task.")
+    print()
+    print("  Once installed:")
+    print("  · SaveSync starts silently every time you log into Windows")
+    print("  · No terminal window appears — it runs completely in the background")
+    print("  · Your registered games are monitored automatically")
+    print("  · You will receive Windows notifications when saves are backed up")
+    print()
+
+    if platform.system() != "Windows":
+        print("  This option is only available on Windows.")
+        print()
+        pause()
+        return
+
+    py_path     = Path(sys.executable)
+    pythonw     = py_path.parent / "pythonw.exe"
+    script_path = Path(__file__).resolve()
+    task_name   = "SaveSyncWatcher"
+
+    print(f"  Script  : {script_path}")
+    print(f"  Runtime : {pythonw}")
+    print()
+
+    if not pythonw.exists():
+        print("  Note: pythonw.exe not found — falling back to python.exe.")
+        print("  A terminal window will briefly appear at startup.")
+        print("  To fix, reinstall Python with the tcl/tk component included.")
+        print()
+        pythonw = py_path
+
+    check = subprocess.run(
+        ["schtasks", "/query", "/tn", task_name], capture_output=True
+    )
+    if check.returncode == 0:
+        print("  A startup task already exists and will be updated.")
+        print()
+        subprocess.run(
+            ["schtasks", "/delete", "/tn", task_name, "/f"], capture_output=True
+        )
+
+    if not confirm("Install startup task now?"):
+        print("\n  Cancelled.")
+        pause()
+        return
+
+    cmd = [
+        "schtasks", "/create",
+        "/tn",  task_name,
+        "/tr",  f'"{pythonw}" "{script_path}" --watch',
+        "/sc",  "ONLOGON",
+        "/rl",  "HIGHEST",
+        "/f",
+    ]
+
+    print()
+    print("  Registering task... (a UAC prompt may appear)")
+    print()
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    if result.returncode == 0:
+        print("  ✓ Startup task installed.")
+        print()
+        print("  SaveSync will now start automatically every time you")
+        print("  log into Windows. To start it right now without rebooting,")
+        print("  go back and choose option 1 (Start watcher now).")
+    else:
+        print("  ✗ Failed to install task.")
+        err = result.stderr.strip() or result.stdout.strip()
+        if err:
+            print(f"  Error: {err}")
+        print()
+        print("  Try running SaveSync as Administrator:")
+        print("  Right-click SaveSync.bat → Run as administrator")
+    print()
+    pause()
+
+
+# ---------------------------------------------------------------
+
+def _remove_startup_task():
+    import platform
+    import subprocess
+
+    header("Remove Windows Startup Task")
+    print("  This will stop SaveSync from starting automatically with Windows.")
+    print()
+    print("  Your games, config and backup files are not affected.")
+    print("  You can reinstall the task at any time from Watcher Setup.")
+    print()
+
+    if platform.system() != "Windows":
+        print("  This option is only available on Windows.")
+        print()
+        pause()
+        return
+
+    task_name = "SaveSyncWatcher"
+    check = subprocess.run(
+        ["schtasks", "/query", "/tn", task_name], capture_output=True
+    )
+
+    if check.returncode != 0:
+        print("  No startup task is currently installed. Nothing to remove.")
+        print()
+        pause()
+        return
+
+    if not confirm("Remove the SaveSync startup task?"):
+        print("\n  Cancelled. Nothing was changed.")
+        pause()
+        return
+
+    result = subprocess.run(
+        ["schtasks", "/delete", "/tn", task_name, "/f"],
+        capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        print("\n  ✓ Startup task removed.")
+        print("  SaveSync will no longer start with Windows.")
+    else:
+        print(f"\n  ✗ Failed: {result.stderr.strip()}")
+    print()
+    pause()
 
 
 # ---------------------------------------------------------------
@@ -943,21 +1170,25 @@ def screen_add_game():
             g["save_path"] = chosen_path
 
     print()
-    print("  SaveSync needs two things to auto-detect and launch your game:\n")
-    print("  1. The PROCESS NAME — what appears in Task Manager while the game runs.")
-    print("     This is usually just the .exe filename, e.g. hollow_knight.exe")
-    print("     Leave blank to skip auto-detection (manual backup only).")
+    hr("·")
+    print("  Game launcher path\n")
+    print("  Provide the full path to the file that opens your game.")
+    print("  This can be a .exe, a .bat, or any other file that launches it.")
+    print("  SaveSync will use this to:")
+    print("    · Detect when the game is running (watcher)")
+    print("    · Create a launcher shortcut (.bat) that backs up on open and close")
     print()
-    g["exe_name"] = ask("Process name (e.g. hollow_knight.exe)", "")
+    print("  Leave blank to skip — you can still back up manually.")
+    print()
+    g["exe_path"] = ask("Full path to game launcher (or leave blank)")
 
-    if g["exe_name"]:
+    if g["exe_path"]:
+        # Derive exe_name automatically from the path
+        g["exe_name"] = Path(g["exe_path"]).name
         print()
-        print("  2. The FULL PATH to the file that launches the game.")
-        print("     This can be a .exe, a .bat, or any file that opens the game.")
-        print("     Example: C:/Games/HollowKnight/hollow_knight.exe")
-        print("     Example: C:/Games/MyGame/launch.bat")
-        print()
-        g["exe_path"] = ask("Full path to game launcher")
+        print(f"  Watcher will look for process: {g['exe_name']}")
+        print("  Open Task Manager while the game runs to confirm this name appears there.")
+        print("  If it differs, you can edit savesync_config.json to correct it.")
 
     print()
     hr("·")
@@ -975,7 +1206,7 @@ def screen_add_game():
     hr("·")
     print("  Trigger settings\n")
 
-    if g["exe_name"]:
+    if g["exe_path"]:
         g["trigger_launch"] = confirm("Backup when game LAUNCHES?")
         g["trigger_close"]  = confirm("Backup when game CLOSES?")
         iv = ask("Backup every N minutes while running (0 = off)", "0")
@@ -990,8 +1221,9 @@ def screen_add_game():
     print("  Summary\n")
     print(f"    Name       : {g['name']}")
     print(f"    Save path  : {g['save_path']}")
-    print(f"    Process    : {g['exe_name'] or '(not set)'}")
-    print(f"    Launch via : {g['exe_path'] or '(not set)'}")
+    print(f"    Launcher   : {g['exe_path'] or '(not set)'}")
+    if g.get("exe_name"):
+        print(f"    Watches for: {g['exe_name']}")
     print(f"    Drive      : {g['drive_folder'] or '(skip)'}")
     print(f"    Archive    : {g['archive_path'] or '(skip)'}")
     print(f"    Local copy : {g['local_copy'] or '(skip)'}")
@@ -1064,10 +1296,10 @@ def screen_list_games():
         print(f"       path     : {g['save_path']}")
         print(f"       backs up : {dest_str}")
         print(f"       triggers : {trig_str}")
-        if g.get("exe_name"):
-            print(f"       process  : {g['exe_name']}")
         if g.get("exe_path"):
-            print(f"       launches : {g['exe_path']}")
+            print(f"       launcher : {g['exe_path']}")
+            exe_display = g.get("exe_name") or Path(g.get("exe_path","")).name
+            print(f"       watching : {exe_display}")
         print()
 
     pause()
@@ -1162,7 +1394,8 @@ def screen_watch():
     print("  Press Ctrl+C at any time to stop.\n")
     print("  Watching for:\n")
     for g in watchable:
-        print(f"    · {g['name']}  ({g['exe_name']})")
+        exe_display = g.get("exe_name") or Path(g.get("exe_path","")).name
+        print(f"    · {g['name']}  ({exe_display})")
 
     for g in games:
         iv = int(g.get("interval_min", 0))
@@ -1242,8 +1475,33 @@ def screen_restore_from_drive():
     header("Restore Saves from Drive")
 
     if not GDRIVE_AVAILABLE:
-        print("  Google API libraries not installed.")
-        print("  Run: pip install google-auth google-auth-oauthlib google-api-python-client")
+        print("  SaveSync could not find the Google Drive libraries on this machine.")
+        print()
+        print("  To fix this, open a terminal and run:")
+        print()
+        print("    pip install google-auth google-auth-oauthlib google-api-python-client")
+        print()
+        print("  Then restart SaveSync and try again.")
+        print()
+        pause()
+        return
+
+    # Check if credentials file exists before even trying to connect
+    if not CREDS_FILE.exists():
+        print("  Google Drive has not been set up yet.")
+        print()
+        print("  SaveSync needs to be connected to your Google account")
+        print("  before it can access any files on Drive.")
+        print()
+        print("  Here is what to do:")
+        print()
+        print("    1.  Go to Settings  →  Google Drive setup")
+        print("    2.  Follow the steps shown there to authenticate")
+        print("    3.  Come back here and try again")
+        print()
+        print("  If you get stuck, open the README.md file that came")
+        print("  with SaveSync — it has step by step instructions")
+        print("  with screenshots for the Google Drive setup process.")
         print()
         pause()
         return
@@ -1252,8 +1510,34 @@ def screen_restore_from_drive():
     try:
         service = get_drive_service()
     except Exception as e:
-        print(f"\n  Could not connect: {e}")
-        print("  Run option 6 (Google Drive setup) first.")
+        print()
+        print("  Could not connect to Google Drive.")
+        print()
+        # Give specific guidance based on the error type
+        err = str(e).lower()
+        if "token" in err or "credential" in err or "oauth" in err or "auth" in err:
+            print("  This looks like an authentication problem.")
+            print()
+            print("  Here is what to do:")
+            print()
+            print("    1.  Go to Settings  →  Google Drive setup")
+            print("    2.  Re-authenticate your Google account")
+            print("    3.  Come back here and try again")
+        elif "connection" in err or "network" in err or "timeout" in err or "ssl" in err:
+            print("  This looks like a network problem.")
+            print()
+            print("  Here is what to do:")
+            print()
+            print("    1.  Check that your internet connection is working")
+            print("    2.  Try again in a moment")
+        else:
+            print(f"  Error detail: {e}")
+            print()
+            print("  Here is what to do:")
+            print()
+            print("    1.  Go to Settings  →  Google Drive setup and re-authenticate")
+            print("    2.  If that does not help, check the README.md file")
+            print("        that came with SaveSync for troubleshooting steps")
         print()
         pause()
         return
@@ -1268,8 +1552,17 @@ def screen_restore_from_drive():
         return
 
     if not folders:
-        print("  No games found in the SaveSync folder on Drive.")
-        print("  Back up at least one game first to populate it.")
+        print("  No games were found in the SaveSync folder on Drive.")
+        print()
+        print("  This means either:")
+        print()
+        print("    · No backups have been made yet")
+        print("      Back up at least one game first using option 5")
+        print("      from the main menu, then come back here.")
+        print()
+        print("    · The backup was made under a different Google account")
+        print("      Go to Settings  →  Google Drive setup to check")
+        print("      which account SaveSync is connected to.")
         print()
         pause()
         return
@@ -1526,7 +1819,7 @@ def screen_create_launcher():
 
 # ---------------------------------------------------------------
 
-def screen_install_startup():
+def screen_install_startup(mode=None):
     header("Install Watcher as Windows Startup Task")
 
     import platform
@@ -1569,33 +1862,37 @@ def screen_install_startup():
     )
     already_exists = check.returncode == 0
 
-    if already_exists:
-        print("  A startup task named 'SaveSyncWatcher' already exists.")
-        print()
-        print("    1.  Update it with current paths")
-        print("    2.  Remove it")
-        print("    0.  Cancel")
-        print()
-        choice = input("  > ").strip()
-
-        if choice == "2":
+    # If called from watcher submenu with explicit mode, skip the menu
+    if mode == "remove":
+        if not already_exists:
+            print("  No startup task is currently installed.")
+            print()
+            pause()
+            return
+        if confirm("Remove the SaveSync startup task?"):
             result = subprocess.run(
                 ["schtasks", "/delete", "/tn", task_name, "/f"],
                 capture_output=True, text=True
             )
             if result.returncode == 0:
                 print("\n  ✓ Startup task removed.")
-                print("  SaveSync will no longer start with Windows.")
+                print("  SaveSync will no longer start automatically with Windows.")
             else:
-                print(f"\n  ✗ Failed to remove task: {result.stderr.strip()}")
-            print()
-            pause()
-            return
-        elif choice != "1":
+                print(f"\n  ✗ Failed to remove: {result.stderr.strip()}")
+        else:
+            print("\n  Cancelled.")
+        print()
+        pause()
+        return
+
+    if already_exists:
+        print("  A startup task named 'SaveSyncWatcher' is already installed.")
+        print("  This will update it with the current file paths.")
+        print()
+        if not confirm("Update the existing task?"):
             print("\n  Cancelled.")
             pause()
             return
-        # Delete existing before recreating with updated paths
         subprocess.run(["schtasks", "/delete", "/tn", task_name, "/f"], capture_output=True)
 
     if not confirm("Install startup task?"):
@@ -1647,18 +1944,22 @@ def screen_install_startup():
 # ---------------------------------------------------------------
 
 def screen_integrity_check():
-    header("Integrity Check")
+    header("Health Check")
     cfg   = load_config()
     games = cfg.get("games", [])
 
     if not games:
-        print("  No games configured.")
-        print("  Go back and choose option 1 to add a game first.")
+        print("  No games configured yet.")
+        print("  Go to the main menu and add a game first.")
         print()
         pause()
         return
 
-    # Ask user to check all or pick one
+    print("  Scans each registered game and checks that SaveSync can")
+    print("  still find the save files locally and on Google Drive.")
+    print("  Run this occasionally to make sure everything is still")
+    print("  pointing to the right place.")
+    print()
     print("    1.  Check all games")
     print("    2.  Check a specific game")
     print("    0.  Back")
@@ -1879,6 +2180,38 @@ def screen_game_database():
                 print()
         pause()
 
+
+# ---------------------------------------------------------------
+
+def screen_settings():
+    while True:
+        header("Settings")
+        print("    1.  Google Drive setup")
+        print("        Connect SaveSync to your Google account.")
+        print()
+        print("    2.  Game database")
+        print("        Download and search the Ludusavi save location database.")
+        print("        Contains tens of thousands of known game save paths.")
+        print()
+        print("    3.  Create game launcher")
+        print("        Generate a shortcut file for a game that backs up")
+        print("        your saves on open and close automatically.")
+        print()
+        print("    0.  Back")
+        print()
+        choice = input("  > ").strip()
+        if choice == "1":
+            screen_drive_setup()
+        elif choice == "2":
+            screen_game_database()
+        elif choice == "3":
+            screen_create_launcher()
+        elif choice == "0":
+            return
+        else:
+            print("\n  Invalid option.")
+            time.sleep(1)
+
 # ---------------------------------------------------------------
 # CLI fallback — used by .bat launchers silently
 # ---------------------------------------------------------------
@@ -1913,4 +2246,5 @@ if __name__ == "__main__":
         except KeyboardInterrupt:
             watcher.stop()
     else:
+        resize_terminal()
         screen_main()
