@@ -60,10 +60,23 @@ log = logging.getLogger("savesync")
 # Terminal helpers
 # ---------------------------------------------------------------
 
-def resize_terminal():
-    """Resize the terminal window to a comfortable size on Windows."""
+def resize_terminal(cols: int = 80, lines: int = 40):
+    """Resize the terminal window to the requested dimensions on Windows."""
     if os.name == "nt":
-        os.system("mode con: cols=80 lines=40")
+        os.system(f"mode con: cols={cols} lines={lines}")
+
+
+def strip_path_quotes(path: str) -> str:
+    """Remove surrounding double-quotes that Windows adds when using 'Copy as path'.
+
+    Windows Explorer's "Copy as path" wraps the path in double-quotes, e.g.:
+        "C:\\Games\\Hollow Knight\\hollow_knight.exe"
+    This function strips those quotes so the path can be used directly.
+    """
+    path = path.strip()
+    if len(path) >= 2 and path.startswith('"') and path.endswith('"'):
+        path = path[1:-1].strip()
+    return path
 
 def clear():
     os.system("cls" if os.name == "nt" else "clear")
@@ -209,7 +222,11 @@ def download_manifest(silent=False) -> bool:
             print()
         urllib.request.urlretrieve(MANIFEST_URL, MANIFEST_FILE)
         MANIFEST_META.write_text(
-            json.dumps({"downloaded_at": now_iso()}, indent=2),
+            json.dumps({
+                "downloaded_at":    now_iso(),
+                "last_update_check": now_iso(),
+                "update_available":  False,
+            }, indent=2),
             encoding="utf-8"
         )
         if not silent:
@@ -310,59 +327,244 @@ def manifest_db_age() -> str:
         return "unknown age"
 
 
-def search_manifest(game_name: str) -> list:
-    """Search the index for a game. Returns list of (display_name, [paths]) tuples.
-    Priority: exact > all words matched > most words matched > partial substring."""
+def _load_manifest_meta() -> dict:
+    """Load ludusavi_meta.json, return {} if missing or corrupt."""
+    try:
+        return json.loads(MANIFEST_META.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_manifest_meta(meta: dict):
+    MANIFEST_META.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+
+def _manifest_update_check_due() -> bool:
+    """Return True if we have not checked for a manifest update today (UTC)."""
+    meta = _load_manifest_meta()
+    last = meta.get("last_update_check", "")
+    if not last:
+        return True
+    try:
+        dt = datetime.datetime.strptime(last, "%Y-%m-%dT%H:%M:%SZ")
+        return dt.date() < datetime.datetime.utcnow().date()
+    except Exception:
+        return True
+
+
+def check_manifest_update_available() -> bool:
+    """
+    Fetch only the HTTP headers of the manifest URL and compare the
+    Last-Modified date with the locally stored downloaded_at timestamp.
+
+    Returns True  if the server copy is newer than the local copy.
+    Returns False if the local copy is up-to-date, or on any network error
+                  (we never want a failed check to disrupt the user).
+
+    Side effect: updates 'last_update_check' in ludusavi_meta.json so the
+    check is only performed once per calendar day.
+    """
+    import urllib.request
+
+    meta = _load_manifest_meta()
+
+    # Record that we checked today
+    meta["last_update_check"] = now_iso()
+    _save_manifest_meta(meta)
+
+    downloaded_at = meta.get("downloaded_at", "")
+    if not downloaded_at:
+        # Never downloaded — not our job to flag an "update"; the UI will
+        # prompt the user to download when they visit the Database screen.
+        return False
+
+    try:
+        req = urllib.request.Request(MANIFEST_URL, method="HEAD")
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            last_modified = resp.headers.get("Last-Modified", "")
+        if not last_modified:
+            return False
+
+        # HTTP date format: "Thu, 01 Jan 2026 12:00:00 GMT"
+        import email.utils
+        server_dt = email.utils.parsedate_to_datetime(last_modified)
+        # Normalise to UTC-naive for comparison
+        server_utc = server_dt.replace(tzinfo=None) - server_dt.utcoffset() \
+            if server_dt.utcoffset() else server_dt.replace(tzinfo=None)
+
+        local_dt = datetime.datetime.strptime(downloaded_at, "%Y-%m-%dT%H:%M:%SZ")
+        return server_utc > local_dt
+
+    except Exception as e:
+        log.debug(f"Manifest update check failed (ignored): {e}")
+        return False
+
+
+def check_manifest_update_silently() -> bool:
+    """
+    Only runs the network check if it is due today.
+    Safe to call from any code path — never raises.
+    """
+    try:
+        if not _manifest_update_check_due():
+            # Already checked today; return cached result from meta
+            meta = _load_manifest_meta()
+            return meta.get("update_available", False)
+        result = check_manifest_update_available()
+        # Cache the result so the UI can read it without hitting the network again
+        meta = _load_manifest_meta()
+        meta["update_available"] = result
+        _save_manifest_meta(meta)
+        return result
+    except Exception:
+        return False
+
+
+
+    """Legacy wrapper — returns top similar matches (no exact-match shortcut).
+    Use search_manifest_split() for the wizard flow."""
+    _, similar = search_manifest_split(game_name)
+    return similar
+
+
+def search_manifest_split(game_name: str) -> "tuple[tuple | None, list]":
+    """
+    Search the manifest index and return two separate buckets:
+
+      exact   — (display_name, [paths]) if the query matches a game name exactly
+                (case-insensitive), otherwise None.
+      similar — list of (display_name, [paths]) for games that share significant
+                words with the query, sorted by relevance, capped at 8.
+                The exact match (if found) is excluded from this list.
+
+    This separation drives the UI logic:
+      · If exact is not None  → offer those paths for selection.
+      · If exact is None      → tell the user "no exact match" and show similar
+                                as reference hints only.
+    """
     index = load_manifest_index()
     if not index:
-        return []
+        return None, []
 
     query       = game_name.lower().strip()
-    query_words = query.split()
+    query_words = set(query.split())
 
-    # 1. Exact match — highest priority, return immediately
+    # ── 1. Exact match (case-insensitive name equality) ───────────
+    exact = None
     if query in index:
         entry = index[query]
-        return [(entry["name"], entry["paths"])]
+        exact = (entry["name"], entry["paths"])
 
+    # ── 2. Similar matches ────────────────────────────────────────
     scored = []
     for key, entry in index.items():
-        key_words = key.split()
+        if key == query:
+            continue   # already captured as exact
 
-        # Count how many query words appear in the key
-        words_matched = sum(1 for w in query_words if w in key_words)
+        key_words     = set(key.split())
+        words_matched = len(query_words & key_words)   # intersection count
 
-        # Skip entries that share zero words with the query
         if words_matched == 0:
             continue
 
-        # Bonus: all words matched
-        all_matched = words_matched == len(query_words)
-
-        # Penalty: how different the total length is
         length_diff = abs(len(key) - len(query))
+        score       = (words_matched * 100) - length_diff
 
-        # Score: more words matched = better, fewer length difference = better
-        # Multiply words_matched heavily so a 4-word match always beats a 1-word match
-        score = (words_matched * 100) - length_diff
-
-        # Extra boost if the full query string is a substring of the key or vice versa
+        # Boost when one string contains the other
         if query in key or key in query:
             score += 50
 
-        scored.append((score, all_matched, entry["name"], entry["paths"]))
+        scored.append((score, entry["name"], entry["paths"]))
 
-    if not scored:
-        return []
-
-    # Sort by score descending
     scored.sort(key=lambda x: x[0], reverse=True)
+    similar = [(name, paths) for _, name, paths in scored[:8]]
 
-    # Return top 8
-    return [(name, paths) for _, _, name, paths in scored[:8]]
+    return exact, similar
 
 
-def ensure_manifest_ready(silent=False) -> bool:
+def resolve_and_validate_path(path: str) -> dict:
+    """
+    Inspect a candidate save path and return a diagnostic dict:
+
+      'ok'          bool   — True if path is ready to use as-is
+      'resolved'    str    — best single resolved path (may equal input)
+      'candidates'  list   — expanded paths when a wildcard was found
+      'issues'      list   — human-readable problem strings (empty = clean)
+
+    Problems detected
+    ─────────────────
+    • Wildcard '*' present (store-user-ID placeholder from Ludusavi).
+      → glob-expanded to find real folders.  If exactly one match, resolved
+        automatically.  If multiple, returned as candidates for the user to
+        pick.  If none, flagged as not-found.
+    • Missing drive letter on Windows (path doesn't start with  X:/ or X:\\).
+    • Path does not exist on this machine (informational — the game may just
+      not be installed yet, so we warn rather than block).
+    """
+    import glob as _glob
+
+    issues     = []
+    candidates = []
+    resolved   = path
+
+    # ── Normalise separators for consistent checking ──────────────
+    normalised = path.replace("\\", "/")
+
+    # ── 1. Missing drive letter (Windows only) ────────────────────
+    if os.name == "nt":
+        import re as _re
+        has_drive = bool(_re.match(r"^[A-Za-z]:[/\\]", normalised))
+        if not has_drive and not normalised.startswith("//"):
+            issues.append(
+                "No drive letter detected (e.g. C:/).  "
+                "The path may be incomplete — check it in Explorer."
+            )
+
+    # ── 2. Wildcard expansion ──────────────────────────────────────
+    if "*" in normalised:
+        # Convert to backslashes for Windows glob
+        glob_path = normalised.replace("/", os.sep)
+        hits = _glob.glob(glob_path)
+        # Keep only directories (save paths are usually folders)
+        hits = [h for h in hits if os.path.isdir(h)]
+        if not hits:
+            # Also try including files in case save is a single file
+            hits = _glob.glob(glob_path)
+        hits = sorted(hits)
+        if len(hits) == 1:
+            resolved   = hits[0].replace("\\", "/")
+            candidates = []
+        elif len(hits) > 1:
+            candidates = [h.replace("\\", "/") for h in hits]
+            resolved   = ""   # ambiguous — caller must ask user to pick
+            issues.append(
+                f"Found {len(hits)} matching folders for the wildcard (*).  "
+                "Pick the one that belongs to your account."
+            )
+        else:
+            issues.append(
+                "The path contains a wildcard (*) but no matching folder was "
+                "found on this machine.  The game may not be installed, or the "
+                "store user-ID folder has a different name.  Check in Explorer."
+            )
+    # ── 3. Existence check (only if no wildcard) ──────────────────
+    elif not os.path.exists(normalised.replace("/", os.sep)):
+        issues.append(
+            "This path does not exist on this machine.  "
+            "If the game is not installed yet that is fine — SaveSync will "
+            "monitor it once the game creates the folder."
+        )
+
+    ok = (len(issues) == 0 and resolved != "")
+    return {
+        "ok":         ok,
+        "resolved":   resolved or path,
+        "candidates": candidates,
+        "issues":     issues,
+    }
+
+
+
     """Check if manifest and index are available. Offer to download if not."""
     if MANIFEST_INDEX.exists():
         return True
@@ -380,68 +582,6 @@ def ensure_manifest_ready(silent=False) -> bool:
     return True
 
 
-SAVE_LOCATIONS_FILE = BASE_DIR / "save_locations.txt"
-
-
-def load_save_locations() -> dict:
-    """Load save_locations.txt into a dict of {lower_game_name: (original_name, path)}."""
-    locations = {}
-    if not SAVE_LOCATIONS_FILE.exists():
-        return locations
-    for line in SAVE_LOCATIONS_FILE.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        parts = line.split(",", 1)
-        if len(parts) == 2:
-            name = parts[0].strip()
-            path = parts[1].strip()
-            locations[name.lower()] = (name, path)
-    return locations
-
-
-def lookup_save_location(game_name: str) -> str | None:
-    """Return the suggested save path for a game name, or None if not found.
-    Does a fuzzy check — the query just needs to appear anywhere in the listed name."""
-    locations = load_save_locations()
-    query = game_name.lower().strip()
-    # Exact match first
-    if query in locations:
-        return locations[query][1]
-    # Partial match — find entries where the query is a substring of the key
-    matches = [(k, v) for k, v in locations.items() if query in k or k in query]
-    if len(matches) == 1:
-        return matches[0][1][1]
-    if len(matches) > 1:
-        # Return the closest match by length difference
-        matches.sort(key=lambda x: abs(len(x[0]) - len(query)))
-        return matches[0][1][1]
-    return None
-
-
-def append_save_location(game_name: str, path: str):
-    """Add or update an entry in save_locations.txt."""
-    locations = load_save_locations()
-    key = game_name.lower()
-    lines = []
-    if SAVE_LOCATIONS_FILE.exists():
-        lines = SAVE_LOCATIONS_FILE.read_text(encoding="utf-8").splitlines()
-
-    new_entry = f"{game_name}, {path}"
-    # If already exists, update the line in place
-    if key in locations:
-        updated = []
-        for line in lines:
-            parts = line.split(",", 1)
-            if len(parts) == 2 and parts[0].strip().lower() == key:
-                updated.append(new_entry)
-            else:
-                updated.append(line)
-        lines = updated
-    else:
-        lines.append(new_entry)
-
-    SAVE_LOCATIONS_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def load_config() -> dict:
@@ -724,6 +864,27 @@ def _notify_after_backup(game: dict):
         )
 
 
+def _watcher_check_manifest_update():
+    """
+    Run silently in a background thread when the watcher starts.
+    If an update is available, fire a Windows toast notification so the
+    user knows to open SaveSync and download it when convenient.
+    """
+    try:
+        available = check_manifest_update_silently()
+        if available:
+            notify(
+                "SaveSync — Database Update Available",
+                "The game save-locations list has been updated. "
+                "Open SaveSync to download the latest version."
+            )
+            log.info("Manifest update available — notification sent.")
+        else:
+            log.debug("Manifest update check: up to date.")
+    except Exception as e:
+        log.debug(f"Watcher manifest update check error (ignored): {e}")
+
+
 class GameWatcher(threading.Thread):
     def __init__(self, games):
         super().__init__(daemon=True)
@@ -819,8 +980,22 @@ def write_launcher(game: dict):
 # ---------------------------------------------------------------
 
 def screen_main():
+    # Run the manifest update check once per session (non-blocking background thread).
+    # The result is cached in ludusavi_meta.json so every loop iteration reads it
+    # instantly without any network I/O.
+    threading.Thread(target=check_manifest_update_silently, daemon=True).start()
+
     while True:
+        resize_terminal(80, 40)
         header()
+
+        # Show update banner if the cached check found a newer version
+        update_flag = _load_manifest_meta().get("update_available", False)
+        if update_flag:
+            print("  ★  Game database update available")
+            print("     Settings → Game database → Download / update database")
+            print()
+
         print("    1.  Add a game")
         print("    2.  My games")
         print("    3.  Remove a game")
@@ -868,6 +1043,7 @@ def screen_main():
 
 def screen_watcher_setup():
     while True:
+        resize_terminal(80, 42)
         header("Watcher")
 
         import subprocess
@@ -1050,224 +1226,534 @@ def _remove_startup_task():
 
 
 # ---------------------------------------------------------------
+# Add-game wizard — step machine with undo support
+# ---------------------------------------------------------------
+# Steps:
+#   0  Game name
+#   1  Save path  (manifest lookup + manual entry)
+#   2  Launcher / exe path
+#   3  Backup destinations
+#   4  Trigger settings
+#   5  Summary + confirm
+#
+# Each step renders on a clean terminal and the user can type "b"
+# (or press 0 where a numbered menu is shown) to go back one step.
+# ---------------------------------------------------------------
 
-def screen_add_game():
-    header("Add a Game")
+_BACK = object()   # sentinel returned when user chooses to go back
 
-    g = dict(GAME_DEFAULTS)
 
-    g["name"] = ask("Game name")
-    if not g["name"]:
-        print("\n  Name cannot be empty.")
-        pause()
-        return
-
+def _add_step_header(title: str, step: int, total: int = 6):
+    """Clear screen, print the SaveSync banner, and show the step title."""
+    resize_terminal(90, 45)
+    clear()
+    print()
+    print("  ░█▀▀░█▀█░█░█░█▀▀░░░█▀▀░█░█░█▀█░█▀▀")
+    print("  ░▀▀█░█▀█░▀▄▀░█▀▀░░░▀▀█░░█░░█░█░█░░")
+    print("  ░▀▀▀░▀░▀░░▀░░▀▀▀░░░▀▀▀░░▀░░▀░▀░▀▀▀")
+    print()
+    print(f"  Add a Game  ·  Step {step} of {total}  ─  {title}")
     print()
     hr("·")
-    print("  Searching for save location...\n")
+    print()
 
-    # --- 1. Check save_locations.txt first (personal overrides) ---
-    manual_suggestion = lookup_save_location(g["name"])
 
-    # --- 2. Check Ludusavi manifest ---
-    manifest_results = []
+def _ask_back(prompt: str, default: str = "") -> str:
+    """Like ask() but returns _BACK if the user types 'b' or 'B'."""
+    suffix = f" [{default}]" if default else ""
+    val = input(f"  {prompt}{suffix}  (or b to go back): ").strip()
+    if val.lower() == "b":
+        return _BACK
+    return val if val else default
+
+
+def _confirm_back(prompt: str):
+    """Like confirm() but returns _BACK if the user types 'b'."""
+    while True:
+        ans = input(f"  {prompt} [y/n/b]: ").strip().lower()
+        if ans == "b":
+            return _BACK
+        if ans in ("y", "n"):
+            return ans == "y"
+        print("  Please type y, n, or b (back).")
+
+
+def _step_name(g: dict) -> "str | object":
+    """Step 0 — enter the game name."""
+    _add_step_header("Game Name", 1)
+    print("  What is the name of the game you want to add?")
+    print()
+    val = _ask_back("Game name")
+    if val is _BACK:
+        return _BACK
+    if not val:
+        print("\n  Name cannot be empty.")
+        time.sleep(1.2)
+        return _BACK   # retry same step
+    return val
+
+
+def _present_and_validate_path(raw_path: str) -> "str | object":
+    """
+    Show the user a selected path, run validation, resolve wildcards / warn
+    about issues, and return the final confirmed path (or _BACK).
+
+    Used after a path is chosen from the manifest or entered manually.
+    """
+    result = resolve_and_validate_path(raw_path)
+
+    # ── Wildcard expanded to multiple candidates ───────────────────
+    if result["candidates"]:
+        _add_step_header("Save-File Location  ·  Resolve Path", 2)
+        print("  The path contains a wildcard (*) for your store user ID.")
+        print("  These folders were found on this machine:\n")
+        for i, c in enumerate(result["candidates"], 1):
+            exists_note = "  ✓" if os.path.exists(c.replace("/", os.sep)) else "  ?"
+            print(f"    {i}.{exists_note}  {c}")
+        print(f"    0.  Enter a path manually instead")
+        print(f"    b.  ← back")
+        print()
+        while True:
+            raw = input("  > ").strip()
+            if raw.lower() == "b":
+                return _BACK
+            if raw == "0":
+                print()
+                val = _ask_back("Save path (folder or file)")
+                if val is _BACK:
+                    return _BACK
+                return _present_and_validate_path(strip_path_quotes(val))
+            if raw.isdigit() and 1 <= int(raw) <= len(result["candidates"]):
+                chosen = result["candidates"][int(raw) - 1]
+                return _present_and_validate_path(chosen)
+            print(f"  Enter a number between 0 and {len(result['candidates'])}, or b.")
+
+    # ── Show path + any warnings ───────────────────────────────────
+    print()
+    print(f"  Path : {result['resolved']}")
+    print()
+    if result["issues"]:
+        for issue in result["issues"]:
+            print(f"  ⚠  {issue}")
+        print()
+
+    # Path looks clean or is a soft warning only — confirm
+    if result["ok"]:
+        print("  ✓  Folder found on this machine.")
+        print()
+
+    ans = _confirm_back("Use this path?")
+    if ans is _BACK:
+        return _BACK
+    if not ans:
+        print()
+        val = _ask_back("Enter a different path (folder or file)")
+        if val is _BACK:
+            return _BACK
+        return _present_and_validate_path(strip_path_quotes(val))
+
+    return result["resolved"]
+
+
+def _step_save_path(g: dict) -> "str | object":
+    """
+    Step 1 — look up and confirm the save-file location.
+
+    Logic
+    ─────
+    1. Check Ludusavi manifest:
+         a. EXACT match  → offer the game's path(s) for selection.
+         b. NO exact match → say so clearly, then show similar games as
+            reference hints to help the user find the right folder manually.
+    2. After any path is chosen, validate it (wildcard expansion, drive
+       letter check, existence check).
+    """
+    _add_step_header("Save-File Location", 2)
+    print(f"  Game: {g['name']}")
+    print()
+    print("  Searching for save location...")
+    print()
+
+    # ── Manifest search ────────────────────────────────────────────
+    exact_match = None
+    similar     = []
     if ensure_manifest_ready(silent=True):
-        manifest_results = search_manifest(g["name"])
+        exact_match, similar = search_manifest_split(g["name"])
 
     chosen_path = None
 
-    if manual_suggestion:
-        print(f"  Found in your personal list (save_locations.txt):")
-        print(f"  → {manual_suggestion}")
+    # ══════════════════════════════════════════════════════════════
+    # CASE A: exact match in Ludusavi database
+    if exact_match and not chosen_path:
+        exact_name, exact_paths = exact_match
+        _add_step_header("Save-File Location  ·  Exact Match Found", 2)
+        print(f"  Game : {g['name']}")
+        print(f"  Found in Ludusavi database: {exact_name}")
         print()
-        if manifest_results and manifest_results[0][0].lower() != g["name"].lower():
-            # Also found in manifest — show both
-            pass
-        if confirm("Use this path?"):
-            chosen_path = manual_suggestion
+        hr("·")
+        print()
 
-    if not chosen_path and manifest_results:
-        if len(manifest_results) == 1:
-            game_match, paths = manifest_results[0]
-            print(f"  Found in Ludusavi database: {game_match}")
+        if len(exact_paths) == 1:
+            print("  Save location:")
+            print(f"    {exact_paths[0]}")
             print()
-            if len(paths) == 1:
-                print(f"  Save location: {paths[0]}")
-                print()
-                if "<storeUserId>" in paths[0] or "*" in paths[0]:
-                    print("  Note: this path contains a wildcard (*) where your user ID")
-                    print("  would go. Check the folder in Explorer to find the right one.")
-                    print()
-                if confirm("Use this path?"):
-                    chosen_path = paths[0]
-            else:
-                print("  Multiple save paths found for this game:\n")
-                for i, p in enumerate(paths, 1):
-                    print(f"    {i}.  {p}")
-                print(f"    0.  None of these — enter manually")
-                print()
-                while True:
-                    raw = input("  > ").strip()
-                    if raw == "0":
-                        break
-                    if raw.isdigit() and 1 <= int(raw) <= len(paths):
-                        chosen_path = paths[int(raw) - 1]
-                        break
-                    print(f"  Enter a number between 0 and {len(paths)}.")
+            return _present_and_validate_path(exact_paths[0])
+
         else:
-            print("  Found multiple games in the Ludusavi database:\n")
-            for i, (gname, paths) in enumerate(manifest_results, 1):
-                print(f"    {i}.  {gname}")
-                for p in paths[:2]:
-                    print(f"         {p}")
-                if len(paths) > 2:
-                    print(f"         ... and {len(paths)-2} more path(s)")
+            print(f"  {len(exact_paths)} save path(s) found for this game:\n")
+            for i, p in enumerate(exact_paths, 1):
+                print(f"    {i}.  {p}")
             print(f"    0.  None of these — enter manually")
+            print(f"    b.  ← back")
             print()
             while True:
                 raw = input("  > ").strip()
+                if raw.lower() == "b":
+                    return _BACK
                 if raw == "0":
                     break
-                if raw.isdigit() and 1 <= int(raw) <= len(manifest_results):
-                    _, paths = manifest_results[int(raw) - 1]
-                    if len(paths) == 1:
-                        chosen_path = paths[0]
-                    else:
-                        print("\n  Paths for that game:\n")
-                        for j, p in enumerate(paths, 1):
-                            print(f"    {j}.  {p}")
-                        print(f"    0.  Enter manually")
-                        print()
-                        while True:
-                            raw2 = input("  > ").strip()
-                            if raw2 == "0":
-                                break
-                            if raw2.isdigit() and 1 <= int(raw2) <= len(paths):
-                                chosen_path = paths[int(raw2) - 1]
-                                break
-                    break
-                print(f"  Enter a number between 0 and {len(manifest_results)}.")
+                if raw.isdigit() and 1 <= int(raw) <= len(exact_paths):
+                    return _present_and_validate_path(exact_paths[int(raw) - 1])
+                print(f"  Enter a number between 0 and {len(exact_paths)}, or b.")
+            # fell through to 0 = enter manually (below)
 
-    if not chosen_path and not manual_suggestion and not manifest_results:
-        print("  No suggestions found in database or personal list.")
+    # ══════════════════════════════════════════════════════════════
+    # CASE B: no exact match
+    # ══════════════════════════════════════════════════════════════
+    elif not exact_match and not chosen_path:
+        _add_step_header("Save-File Location  ·  No Exact Match", 2)
+        print(f"  Game: {g['name']}")
+        print()
+        print("  No exact match found in the Ludusavi database for this title.")
+        print()
 
-    if not chosen_path:
-        print()
-        print("  Tip: point to the FOLDER that contains your saves.")
-        print("  The entire folder (and subfolders) will be backed up.")
-        print("  You can also point to a single file if needed.")
-        print()
-        g["save_path"] = ask("Save path (folder or file)")
-    else:
-        print()
-        print(f"  Selected: {chosen_path}")
-        print()
-        override = confirm("Use a different path instead?")
-        if override:
+        if similar:
+            hr("·")
             print()
-            g["save_path"] = ask("Save path (folder or file)")
+            print("  Similar games were found — they might help you locate the")
+            print("  save folder if this title shares a location with a series:")
+            print()
+            for i, (sname, spaths) in enumerate(similar, 1):
+                print(f"    {i}.  {sname}")
+                for p in spaths[:2]:
+                    print(f"           {p}")
+                if len(spaths) > 2:
+                    print(f"           ... and {len(spaths)-2} more path(s)")
+                print()
+            hr("·")
+            print()
+            print("  Options:")
+            print("    · Use one of the similar paths above as a starting point")
+            print("    · Enter the path manually (paste from Explorer)")
+            print()
+            print(f"  Type a number (1–{len(similar)}) to use a similar game's path,")
+            print(f"  or press Enter to skip straight to manual entry.")
+            print(f"  Type b to go back.")
+            print()
+            raw = input("  > ").strip()
+            if raw.lower() == "b":
+                return _BACK
+            if raw.isdigit() and 1 <= int(raw) <= len(similar):
+                _, spaths = similar[int(raw) - 1]
+                if len(spaths) == 1:
+                    print()
+                    print("  Using similar game path as a starting point.")
+                    return _present_and_validate_path(spaths[0])
+                else:
+                    # Multiple paths for that similar game
+                    _add_step_header("Save-File Location  ·  Similar Game Paths", 2)
+                    print("  Paths for that game:\n")
+                    for j, p in enumerate(spaths, 1):
+                        print(f"    {j}.  {p}")
+                    print(f"    0.  Enter manually instead")
+                    print(f"    b.  ← back")
+                    print()
+                    while True:
+                        raw2 = input("  > ").strip()
+                        if raw2.lower() == "b":
+                            return _BACK
+                        if raw2 == "0":
+                            break
+                        if raw2.isdigit() and 1 <= int(raw2) <= len(spaths):
+                            return _present_and_validate_path(spaths[int(raw2) - 1])
+                        print(f"  Enter a number between 0 and {len(spaths)}, or b.")
         else:
-            g["save_path"] = chosen_path
+            print("  No similar games found in the database either.")
+            print()
 
+    # ══════════════════════════════════════════════════════════════
+    # MANUAL ENTRY (fallback for all cases)
+    # ══════════════════════════════════════════════════════════════
+    _add_step_header("Save-File Location  ·  Enter Path", 2)
+    print(f"  Game: {g['name']}")
+    print()
+    print("  Enter the path to the folder (or file) that contains your saves.")
+    print()
+    print("  Tips:")
+    print("    · Point to the FOLDER — SaveSync backs up everything inside it.")
+    print("    · You can paste a path copied with 'Copy as path' in Explorer.")
+    print("    · Surrounding quotes are stripped automatically.")
+    print()
+    val = _ask_back("Save path (folder or file)")
+    if val is _BACK:
+        return _BACK
+    return _present_and_validate_path(strip_path_quotes(val))
+
+
+def _step_exe_path(g: dict) -> "str | object":
+    """Step 2 — optional launcher / exe path."""
+    _add_step_header("Game Launcher", 3)
+    print(f"  Game: {g['name']}")
+    print(f"  Save: {g['save_path']}")
     print()
     hr("·")
-    print("  Game launcher path\n")
+    print()
     print("  Provide the full path to the file that opens your game.")
-    print("  This can be a .exe, a .bat, or any other file that launches it.")
+    print("  This can be a .exe, a .bat, or any other launcher file.")
+    print()
     print("  SaveSync will use this to:")
-    print("    · Detect when the game is running (watcher)")
-    print("    · Create a launcher shortcut (.bat) that backs up on open and close")
+    print("    · Detect when the game is running (process watcher)")
+    print("    · Create a .bat shortcut that backs up on open and close")
+    print()
+    print("  You can paste a path copied with 'Copy as path' in Explorer.")
+    print("  Quotes around the path are stripped automatically.")
     print()
     print("  Leave blank to skip — you can still back up manually.")
     print()
-    g["exe_path"] = ask("Full path to game launcher (or leave blank)")
-
-    if g["exe_path"]:
-        # Derive exe_name automatically from the path
-        g["exe_name"] = Path(g["exe_path"]).name
+    val = _ask_back("Full path to game launcher (or leave blank)")
+    if val is _BACK:
+        return _BACK
+    exe = strip_path_quotes(val)
+    if exe:
+        exe_name = Path(exe).name
         print()
-        print(f"  Watcher will look for process: {g['exe_name']}")
+        print(f"  Watcher will look for process: {exe_name}")
         print("  Open Task Manager while the game runs to confirm this name appears there.")
-        print("  If it differs, you can edit savesync_config.json to correct it.")
+        print("  If it differs, edit savesync_config.json to correct exe_name.")
+        print()
+        time.sleep(1.5)
+    return exe   # may be ""
 
+
+def _step_destinations(g: dict) -> "dict | object":
+    """Step 3 — backup destinations."""
+    _add_step_header("Backup Destinations", 4)
+    print(f"  Game: {g['name']}")
     print()
     hr("·")
-    print("  Backup destinations — leave blank to skip\n")
-    g["drive_folder"] = ask("Google Drive folder (e.g. SaveSync/MyGame)", "")
-    g["archive_path"] = ask("Local .7z archive path (e.g. D:/Backups/mygame.7z)", "")
-    g["local_copy"]   = ask("Local folder copy path", "")
+    print()
+    print("  Where should SaveSync store your backups?")
+    print("  Leave any field blank to skip that destination.")
+    print("  At least one destination is required.")
+    print()
+    print("  Type  b  at any prompt to go back to the previous step.")
+    print()
 
-    if not g["drive_folder"] and not g["archive_path"] and not g["local_copy"]:
-        print("\n  At least one backup destination is required.")
-        pause()
-        return
+    drive = _ask_back("Google Drive folder (e.g. SaveSync/MyGame)", "")
+    if drive is _BACK:
+        return _BACK
 
     print()
+    archive = _ask_back("Local .7z archive path (e.g. D:/Backups/mygame.7z)", "")
+    if archive is _BACK:
+        return _BACK
+
+    print()
+    local = _ask_back("Local folder copy path", "")
+    if local is _BACK:
+        return _BACK
+
+    if not drive and not archive and not local:
+        print()
+        print("  ✗  At least one backup destination is required.")
+        print("     Please enter at least one of the options above.")
+        time.sleep(2)
+        return _step_destinations(g)   # retry same step
+
+    return {"drive_folder": drive, "archive_path": archive, "local_copy": local}
+
+
+def _step_triggers(g: dict) -> "dict | object":
+    """Step 4 — backup triggers and limits."""
+    _add_step_header("Trigger Settings", 5)
+    print(f"  Game: {g['name']}")
+    print()
     hr("·")
-    print("  Trigger settings\n")
+    print()
 
-    if g["exe_path"]:
-        g["trigger_launch"] = confirm("Backup when game LAUNCHES?")
-        g["trigger_close"]  = confirm("Backup when game CLOSES?")
-        iv = ask("Backup every N minutes while running (0 = off)", "0")
-        g["interval_min"] = int(iv) if iv.isdigit() else 0
+    result = {}
 
-    mx = ask("Max .7z snapshots to keep", "10")
-    g["max_backups"] = int(mx) if mx.isdigit() else 10
+    if g.get("exe_path"):
+        print("  When should SaveSync back up automatically?\n")
 
-    # Summary
+        ans = _confirm_back("Backup when game LAUNCHES?")
+        if ans is _BACK:
+            return _BACK
+        result["trigger_launch"] = bool(ans)
+
+        print()
+        ans = _confirm_back("Backup when game CLOSES?")
+        if ans is _BACK:
+            return _BACK
+        result["trigger_close"] = bool(ans)
+
+        print()
+        iv = _ask_back("Backup every N minutes while running (0 = off)", "0")
+        if iv is _BACK:
+            return _BACK
+        result["interval_min"] = int(iv) if str(iv).isdigit() else 0
+        print()
+    else:
+        result["trigger_launch"] = False
+        result["trigger_close"]  = False
+        result["interval_min"]   = 0
+
+    mx = _ask_back("Max .7z snapshots to keep (older ones are deleted)", "10")
+    if mx is _BACK:
+        return _BACK
+    result["max_backups"] = int(mx) if str(mx).isdigit() else 10
+
+    return result
+
+
+def _step_confirm(g: dict) -> "bool | object":
+    """Step 5 — show full summary and ask for final confirmation."""
+    resize_terminal(90, 45)
+    clear()
+    print()
+    print("  ░█▀▀░█▀█░█░█░█▀▀░░░█▀▀░█░█░█▀█░█▀▀")
+    print("  ░▀▀█░█▀█░▀▄▀░█▀▀░░░▀▀█░░█░░█░█░█░░")
+    print("  ░▀▀▀░▀░▀░░▀░░▀▀▀░░░▀▀▀░░▀░░▀░▀░▀▀▀")
+    print()
+    print("  Add a Game  ·  Step 6 of 6  ─  Review & Confirm")
     print()
     hr()
-    print("  Summary\n")
-    print(f"    Name       : {g['name']}")
-    print(f"    Save path  : {g['save_path']}")
-    print(f"    Launcher   : {g['exe_path'] or '(not set)'}")
-    if g.get("exe_name"):
-        print(f"    Watches for: {g['exe_name']}")
-    print(f"    Drive      : {g['drive_folder'] or '(skip)'}")
-    print(f"    Archive    : {g['archive_path'] or '(skip)'}")
-    print(f"    Local copy : {g['local_copy'] or '(skip)'}")
     print()
+    print("  Summary\n")
+    print(f"    Name        : {g['name']}")
+    print(f"    Save path   : {g['save_path']}")
+    print(f"    Launcher    : {g.get('exe_path') or '(not set)'}")
+    if g.get("exe_name"):
+        print(f"    Watches for : {g['exe_name']}")
+    print(f"    Drive       : {g.get('drive_folder') or '(skip)'}")
+    print(f"    Archive     : {g.get('archive_path') or '(skip)'}")
+    print(f"    Local copy  : {g.get('local_copy') or '(skip)'}")
+    if g.get("exe_path"):
+        trigs = []
+        if g.get("trigger_launch"): trigs.append("on launch")
+        if g.get("trigger_close"):  trigs.append("on close")
+        if g.get("interval_min", 0) > 0:
+            trigs.append(f"every {g['interval_min']} min")
+        print(f"    Triggers    : {', '.join(trigs) if trigs else 'none'}")
+    print(f"    Max backups : {g.get('max_backups', 10)}")
+    print()
+    hr()
+    print()
+    ans = _confirm_back("Save this game?")
+    return ans   # True / False / _BACK
 
-    if not confirm("Save this game?"):
-        print("\n  Cancelled.")
-        pause()
-        return
 
-    cfg = load_config()
-    cfg["games"].append(g)
-    save_config(cfg)
-    log.info(f"Added game: {g['name']}")
+def screen_add_game():
+    """Add-game wizard with per-step clear, resize, and full undo support."""
+    g = dict(GAME_DEFAULTS)
 
-    if g["exe_path"]:
-        write_launcher(g)
+    # Each element of `steps` is a callable that returns its result or _BACK.
+    # We keep a parallel list of the values each step produced so we can
+    # restore them when the user goes back.
+    results: list = [None] * 6   # one slot per step
+    step = 0
 
-    print(f"\n  '{g['name']}' added successfully.")
+    while step < 6:
 
-    # Offer to save the path to save_locations.txt
-    existing = lookup_save_location(g["name"])
-    if g.get("save_path") and g["save_path"] != existing:
-        print()
-        if existing:
-            print(f"  The internal list has a different path for this game:")
-            print(f"    Listed  : {existing}")
-            print(f"    You used: {g['save_path']}")
+        # ── Step 0: game name ────────────────────────────────────
+        if step == 0:
+            val = _step_name(g)
+            if val is _BACK:
+                # Step 0 is the first step — going back exits the wizard
+                resize_terminal(80, 40)
+                return
+            g["name"] = val
+            results[0] = val
+            step = 1
+
+        # ── Step 1: save path ────────────────────────────────────
+        elif step == 1:
+            val = _step_save_path(g)
+            if val is _BACK:
+                step = 0
+                continue
+            g["save_path"] = val
+            results[1] = val
+            step = 2
+
+        # ── Step 2: exe path ─────────────────────────────────────
+        elif step == 2:
+            val = _step_exe_path(g)
+            if val is _BACK:
+                step = 1
+                continue
+            g["exe_path"] = val
+            g["exe_name"] = Path(val).name if val else ""
+            results[2] = val
+            step = 3
+
+        # ── Step 3: destinations ──────────────────────────────────
+        elif step == 3:
+            val = _step_destinations(g)
+            if val is _BACK:
+                step = 2
+                continue
+            g.update(val)
+            results[3] = val
+            step = 4
+
+        # ── Step 4: triggers ─────────────────────────────────────
+        elif step == 4:
+            val = _step_triggers(g)
+            if val is _BACK:
+                step = 3
+                continue
+            g.update(val)
+            results[4] = val
+            step = 5
+
+        # ── Step 5: summary + confirm ─────────────────────────────
+        elif step == 5:
+            ans = _step_confirm(g)
+            if ans is _BACK:
+                step = 4
+                continue
+            if not ans:
+                resize_terminal(80, 40)
+                clear()
+                header("Add a Game")
+                print("\n  Cancelled — nothing was saved.")
+                pause()
+                return
+
+            # ── Save ──────────────────────────────────────────────
+            cfg = load_config()
+            cfg["games"].append(g)
+            save_config(cfg)
+            log.info(f"Added game: {g['name']}")
+
+            if g.get("exe_path"):
+                write_launcher(g)
+
+            resize_terminal(90, 45)
+            clear()
+            header("Add a Game")
+            print(f"\n  ✓  '{g['name']}' added successfully.\n")
             print()
-            if confirm("Update the internal list with your path?"):
-                append_save_location(g["name"], g["save_path"])
-                print("  Internal list updated.")
-        else:
-            print("  This game is not in the internal locations list.")
-            if confirm("Add it for future use?"):
-                append_save_location(g["name"], g["save_path"])
-                print("  Added to save_locations.txt.")
-
-    pause()
+            pause()
+            resize_terminal(80, 40)
+            return
 
 
 # ---------------------------------------------------------------
 
 def screen_list_games():
+    resize_terminal(90, 50)
     header("Game List")
     cfg = load_config()
     games = cfg.get("games", [])
@@ -1308,6 +1794,7 @@ def screen_list_games():
 # ---------------------------------------------------------------
 
 def screen_remove_game():
+    resize_terminal(80, 40)
     header("Remove a Game")
     cfg = load_config()
     games = cfg.get("games", [])
@@ -1323,18 +1810,25 @@ def screen_remove_game():
         return
 
     chosen = games[idx]
-    print()
+
+    # Clear before showing the confirmation so the list doesn't linger
+    resize_terminal(80, 40)
+    header("Remove a Game")
     print(f"  You selected: {chosen['name']}")
     print()
+    print(f"  Save path  : {chosen.get('save_path', '(not set)')}")
+    if chosen.get('exe_path'):
+        print(f"  Launcher   : {chosen['exe_path']}")
+    print()
     print("  Note: this only removes the game from SaveSync.")
-    print("  Your actual save files will NOT be deleted.")
+    print("  Your actual save files and backups are NOT deleted.")
     print()
 
     if confirm(f"Remove '{chosen['name']}' from SaveSync?"):
         cfg["games"].pop(idx)
         save_config(cfg)
         log.info(f"Removed game: {chosen['name']}")
-        print(f"\n  '{chosen['name']}' removed.")
+        print(f"\n  ✓  '{chosen['name']}' removed from SaveSync.")
     else:
         print("\n  Cancelled. Nothing was changed.")
 
@@ -1344,6 +1838,7 @@ def screen_remove_game():
 # ---------------------------------------------------------------
 
 def screen_backup_now():
+    resize_terminal(80, 40)
     header("Backup Now")
     cfg = load_config()
     games = cfg.get("games", [])
@@ -1359,7 +1854,10 @@ def screen_backup_now():
         return
 
     game = games[idx]
-    print()
+
+    # Clear the picker list before showing backup progress
+    resize_terminal(80, 40)
+    header("Backup Now")
     print(f"  Backing up '{game['name']}'...")
     print()
 
@@ -1376,6 +1874,7 @@ def screen_backup_now():
 # ---------------------------------------------------------------
 
 def screen_watch():
+    resize_terminal(80, 44)
     header("Background Watcher")
     cfg = load_config()
     games = cfg.get("games", [])
@@ -1408,6 +1907,9 @@ def screen_watch():
 
     watcher = GameWatcher(games)
     watcher.start()
+    # Fire the daily manifest update check in the background so it can send
+    # a notification if a newer database is available.
+    threading.Thread(target=_watcher_check_manifest_update, daemon=True).start()
 
     try:
         while True:
@@ -1422,6 +1924,7 @@ def screen_watch():
 # ---------------------------------------------------------------
 
 def screen_drive_setup():
+    resize_terminal(90, 48)
     header("Google Drive Setup")
 
     if not GDRIVE_AVAILABLE:
@@ -1472,6 +1975,7 @@ def screen_drive_setup():
 # ---------------------------------------------------------------
 
 def screen_restore_from_drive():
+    resize_terminal(90, 50)
     header("Restore Saves from Drive")
 
     if not GDRIVE_AVAILABLE:
@@ -1573,7 +2077,10 @@ def screen_restore_from_drive():
         return
 
     folder_name, folder_id = folders[idx]
-    print()
+
+    # Clear picker clutter before showing restore details
+    resize_terminal(90, 50)
+    header("Restore Saves from Drive")
     print(f"  Reading config for '{folder_name}' from Drive...")
 
     drive_config = fetch_game_config_from_drive(service, folder_id)
@@ -1758,6 +2265,7 @@ def screen_restore_from_drive():
 # ---------------------------------------------------------------
 
 def screen_create_launcher():
+    resize_terminal(90, 44)
     header("Create Launcher")
     cfg   = load_config()
     games = cfg.get("games", [])
@@ -1802,7 +2310,9 @@ def screen_create_launcher():
             pause()
             return
 
-    print()
+    # Clear before writing so the file-picker list doesn't linger
+    resize_terminal(90, 44)
+    header("Create Launcher")
     print(f"  Game        : {game['name']}")
     print(f"  Launches    : {game['exe_path']}")
     print(f"  Output file : {bat.name}")
@@ -1820,6 +2330,7 @@ def screen_create_launcher():
 # ---------------------------------------------------------------
 
 def screen_install_startup(mode=None):
+    resize_terminal(90, 48)
     header("Install Watcher as Windows Startup Task")
 
     import platform
@@ -1944,6 +2455,7 @@ def screen_install_startup(mode=None):
 # ---------------------------------------------------------------
 
 def screen_integrity_check():
+    resize_terminal(90, 50)
     header("Health Check")
     cfg   = load_config()
     games = cfg.get("games", [])
@@ -2112,6 +2624,7 @@ def screen_integrity_check():
 # ---------------------------------------------------------------
 
 def screen_game_database():
+    resize_terminal(90, 50)
     header("Game Database")
 
     index_count = 0
@@ -2122,15 +2635,22 @@ def screen_game_database():
         except Exception:
             pass
 
-    age = manifest_db_age()
+    age  = manifest_db_age()
+    meta = _load_manifest_meta()
 
     print("  Ludusavi community database")
     print("  Covers tens of thousands of PC games with known save locations.")
     print()
     if MANIFEST_INDEX.exists():
-        print(f"  Status  : Downloaded and indexed")
-        print(f"  Games   : {index_count:,}")
-        print(f"  Age     : {age}")
+        print(f"  Status        : Downloaded and indexed")
+        print(f"  Games         : {index_count:,}")
+        print(f"  Downloaded    : {age}")
+        last_check = meta.get("last_update_check", "")
+        if last_check:
+            print(f"  Last checked  : {fmt_ts(last_check)}")
+        if meta.get("update_available"):
+            print()
+            print("  ★  A newer version is available — choose option 1 to update.")
     else:
         print("  Status  : Not downloaded yet")
     print()
@@ -2143,7 +2663,8 @@ def screen_game_database():
     choice = input("  > ").strip()
 
     if choice == "1":
-        print()
+        resize_terminal(90, 48)
+        header("Game Database  ·  Downloading")
         ok = download_manifest(silent=False)
         if ok:
             print()
@@ -2154,30 +2675,46 @@ def screen_game_database():
         pause()
 
     elif choice == "2":
-        print()
+        resize_terminal(90, 48)
+        header("Game Database  ·  Search")
         query = ask("Game name to search")
         if not query:
             return
         if not ensure_manifest_ready():
             pause()
             return
-        print()
-        results = search_manifest(query)
-        if not results:
-            print(f"  No results found for '{query}'.")
-            # Also check personal list
-            manual = lookup_save_location(query)
-            if manual:
-                print(f"  Found in your personal list: {manual}")
+
+        exact, similar = search_manifest_split(query)
+
+        # Clear and show results on a clean screen
+        resize_terminal(90, 55)
+        header("Game Database  ·  Search Results")
+
+        if exact:
+            exact_name, exact_paths = exact
+            print(f"  Exact match: {exact_name}\n")
+            for p in exact_paths:
+                note = "  [wildcard — check in Explorer]" if "*" in p else ""
+                print(f"    → {p}{note}")
+            print()
         else:
-            print(f"  Results for '{query}':\n")
-            for gname, paths in results:
+            print(f"  No exact match found for '{query}'.")
+            print()
+
+        if similar:
+            if not exact:
+                print("  Similar games in the database:\n")
+            else:
+                print("  Other similar games:\n")
+            for gname, paths in similar:
                 print(f"  {gname}")
                 for p in paths:
-                    has_wildcard = "*" in p
-                    note = "  [contains wildcard — check in Explorer]" if has_wildcard else ""
+                    note = "  [wildcard]" if "*" in p else ""
                     print(f"    → {p}{note}")
                 print()
+        elif not exact:
+            print("  No similar games found either.")
+
         pause()
 
 
@@ -2185,6 +2722,7 @@ def screen_game_database():
 
 def screen_settings():
     while True:
+        resize_terminal(80, 42)
         header("Settings")
         print("    1.  Google Drive setup")
         print("        Connect SaveSync to your Google account.")
@@ -2238,7 +2776,9 @@ if __name__ == "__main__":
         games = cfg.get("games", [])
         watcher = GameWatcher(games)
         watcher.start()
-        print("SaveSync watcher running. Press Ctrl+C to stop.")
+        # Daily manifest update check — sends a toast notification if an update exists.
+        threading.Thread(target=_watcher_check_manifest_update, daemon=True).start()
+        log.info("SaveSync watcher started (--watch mode).")
         try:
             while True:
                 schedule.run_pending()
