@@ -3,7 +3,7 @@ SaveSync GUI — CustomTkinter frontend for SaveSync.
 Imports all logic from savesync.py — never modifies it.
 
 Dependencies:
-    pip install customtkinter pystray Pillow
+    pip install customtkinter pystray Pillow requests
 """
 
 import os
@@ -11,19 +11,28 @@ import sys
 import json
 import threading
 import datetime
+import hashlib
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from pathlib import Path
+
 
 import customtkinter as ctk
 
 # System tray support
 try:
     import pystray
-    from PIL import Image, ImageDraw
+    from PIL import Image, ImageDraw, ImageFont
     TRAY_AVAILABLE = True
-except ImportError:
+except ImportError as _e:
     TRAY_AVAILABLE = False
+
+# HTTP requests for SteamGridDB
+try:
+    import requests as _requests
+    REQUESTS_AVAILABLE = True
+except ImportError:
+    REQUESTS_AVAILABLE = False
 
 # ---------------------------------------------------------------
 # Import everything from savesync.py (the logic layer)
@@ -49,26 +58,36 @@ def _create_tray_icon_image():
 # ---------------------------------------------------------------
 # Appearance
 # ---------------------------------------------------------------
-ctk.set_appearance_mode("system")
+ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-# Colour palette
-COL_BG_DARK    = "#1a1a2e"
-COL_BG_CARD    = "#16213e"
-COL_BG_SIDEBAR = "#0f3460"
-COL_ACCENT     = "#3b82f6"
-COL_ACCENT_HVR = "#2563eb"
-COL_SUCCESS    = "#22c55e"
-COL_WARNING    = "#f59e0b"
-COL_ERROR      = "#ef4444"
-COL_TEXT       = "#e2e8f0"
-COL_TEXT_DIM   = "#94a3b8"
-COL_CARD_HOVER = "#1e3a5f"
+# Colour palette — refined dark navy theme
+COL_BG_DARK    = "#0d111e"     # unified app background
+COL_BG_CARD    = "#141928"     # card surface — slightly lighter than bg
+COL_BG_SIDEBAR = "#0d111e"     # sidebar — same base as content
+COL_ACCENT     = "#6c63ff"     # primary purple
+COL_ACCENT_HVR = "#5a52e0"     # purple hover
+COL_SUCCESS    = "#4ade80"     # green
+COL_WARNING    = "#f59e0b"     # amber
+COL_ERROR      = "#ef4444"     # red
+COL_TEXT       = "#f0f0f0"     # primary text
+COL_TEXT_DIM   = "#6b7280"     # secondary text
+COL_TEXT_MID   = "#9ca3af"     # mid-brightness text
+COL_CARD_HOVER = "#1e2d45"
+COL_BORDER     = "#1e2540"     # default card border
+COL_BADGE_DRIVE_BG = "#1a2545"
+COL_BADGE_DRIVE_FG = "#6aaff5"
+COL_BADGE_7Z_BG    = "#2a2200"
+COL_BADGE_7Z_FG    = "#f5c542"
+COL_BADGE_AUTO_BG  = "#0a2010"
+COL_BADGE_AUTO_FG  = "#4ade80"
+COL_BTN_GHOST  = "#1a2035"     # ghost button background
 
-FONT_TITLE  = ("Segoe UI", 20, "bold")
-FONT_HEAD   = ("Segoe UI", 15, "bold")
+FONT_TITLE  = ("Segoe UI", 17, "bold")
+FONT_HEAD   = ("Segoe UI", 13, "bold")
 FONT_BODY   = ("Segoe UI", 13)
 FONT_SMALL  = ("Segoe UI", 11)
+FONT_TINY   = ("Segoe UI", 10)
 FONT_MONO   = ("Consolas", 11)
 
 
@@ -87,6 +106,289 @@ def ensure_manifest_ready(silent=False) -> bool:
         if not ss.build_manifest_index(silent=True):
             return False
     return True
+
+
+# ---------------------------------------------------------------
+# Thumbnail manager — SteamGridDB covers, cached locally
+# ---------------------------------------------------------------
+STEAMGRIDDB_API_KEY = "eef436c06c902672e16d69ba375c0cb7"
+THUMB_CACHE_DIR = ss.BASE_DIR / "thumbnail_cache"
+THUMB_SIZE = (220, 300)        # portrait 2:3 ratio — matches game cover art
+THUMB_CACHE_VERSION = "2"      # bump when endpoint or size changes → clears old cache
+
+
+class ThumbnailManager:
+    """Fetches and caches game cover thumbnails from SteamGridDB.
+
+    Cache structure:
+        thumbnail_cache/
+            index.json        — maps game name → {sgdb_id, thumb_url, filename}
+            <hash>.png        — downloaded thumbnail files
+    """
+
+    _INDEX_FILE = THUMB_CACHE_DIR / "index.json"
+    _lock = threading.Lock()
+
+    def __init__(self):
+        THUMB_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        self._index = self._load_index()
+        # If cache version changed (new endpoint/size), nuke stale files
+        if self._index.get("__version__") != THUMB_CACHE_VERSION:
+            for f in THUMB_CACHE_DIR.glob("*.png"):
+                try: f.unlink()
+                except Exception: pass
+            self._index = {"__version__": THUMB_CACHE_VERSION}
+            self._save_index()
+        self._ctk_cache = {}  # str -> ctk.CTkImage
+
+    # ── Index persistence ─────────────────────────────────────
+    def _load_index(self) -> dict:
+        if self._INDEX_FILE.exists():
+            try:
+                return json.loads(self._INDEX_FILE.read_text(encoding="utf-8"))
+            except Exception:
+                return {}
+        return {}
+
+    def _save_index(self):
+        try:
+            self._INDEX_FILE.write_text(
+                json.dumps(self._index, indent=2, ensure_ascii=False),
+                encoding="utf-8")
+        except Exception:
+            pass
+
+    # ── Public API ────────────────────────────────────────────
+    def get_thumbnail(self, game_name: str):
+        """Return a CTkImage for the game if cached on disk, else None.
+        Loads the saved PNG, normalises it to a clean RGB canvas, and
+        wraps it in CTkImage.  Returns None on any failure so the caller
+        can fall back to a pure-CTk placeholder (no PIL/DIB risk)."""
+        if game_name in self._ctk_cache:
+            return self._ctk_cache[game_name]
+
+        entry = self._index.get(game_name)
+        if not entry:
+            return None
+        filepath = THUMB_CACHE_DIR / entry.get("filename", "")
+        if not filepath.exists():
+            return None
+
+        try:
+            raw = Image.open(filepath)
+            raw.load()                           # force full decode
+            # Paste onto a guaranteed-clean RGB canvas of the right size.
+            # This strips embedded profiles, unusual modes, APNG frames, etc.
+            canvas = Image.new("RGB", THUMB_SIZE, (20, 20, 40))
+            src = self._fit_cover(raw.convert("RGB"), THUMB_SIZE)
+            canvas.paste(src)
+            ctk_img = ctk.CTkImage(light_image=canvas, dark_image=canvas,
+                                   size=THUMB_SIZE)
+            self._ctk_cache[game_name] = ctk_img
+            return ctk_img
+        except Exception:
+            return None
+
+    # ── Placeholder helpers (no PIL — pure CTk widgets) ───────────
+    def placeholder_color(self, game_name: str) -> str:
+        """Return a deterministic dark hex colour string for this game."""
+        h = hashlib.md5(game_name.encode()).hexdigest()
+        b = int(h[:2], 16)
+        r = 30 + (b % 60)
+        g = 20 + ((b * 3) % 50)
+        bl = 60 + ((b * 7) % 100)
+        return f"#{r:02x}{g:02x}{bl:02x}"
+
+    def placeholder_initials(self, game_name: str) -> str:
+        """Return up to 2 initials for the game name."""
+        words = game_name.split()
+        initials = ""
+        for word in words:
+            ch = next((c for c in word if c.isalnum()), None)
+            if ch:
+                initials += ch.upper()
+            if len(initials) >= 2:
+                break
+        return initials or "?"
+
+    def fetch_thumbnail(self, game_name: str) -> bool:
+        """Fetch from SteamGridDB and cache locally.  Blocking — call from thread.
+        Returns True if a thumbnail was downloaded (or already cached)."""
+        if not REQUESTS_AVAILABLE:
+            ss.log.warning("ThumbnailManager: 'requests' not installed — cannot fetch thumbnails")
+            return False
+
+        with self._lock:
+            # Already cached?
+            entry = self._index.get(game_name)
+            if entry and (THUMB_CACHE_DIR / entry.get("filename", "")).exists():
+                return True
+
+        try:
+            headers = {"Authorization": f"Bearer {STEAMGRIDDB_API_KEY}"}
+
+            # Step 1: search for the game
+            search_url = (
+                f"https://www.steamgriddb.com/api/v2/search/autocomplete/"
+                f"{_requests.utils.quote(game_name)}"
+            )
+            resp = _requests.get(search_url, headers=headers, timeout=10)
+            if resp.status_code == 401:
+                ss.log.error("SGDB: API key rejected (401) — check STEAMGRIDDB_API_KEY in savesync_gui.py")
+                return False
+            if resp.status_code != 200:
+                ss.log.warning(f"SGDB search HTTP {resp.status_code} for '{game_name}'")
+                return False
+            data = resp.json()
+            games = data.get("data", [])
+            if not games:
+                ss.log.info(f"SGDB: no match found for '{game_name}' — try a shorter/common name")
+                return False
+            sgdb_id = games[0]["id"]
+            ss.log.debug(f"SGDB: found id={sgdb_id} for '{game_name}'")
+
+            # Step 2: try portrait grids (600x900) first, fall back to any grid
+            grids_portrait_url = (
+                f"https://www.steamgriddb.com/api/v2/grids/game/{sgdb_id}"
+                f"?dimensions=600x900"
+            )
+            resp2 = _requests.get(grids_portrait_url, headers=headers, timeout=10)
+            grids = []
+            if resp2.status_code == 200:
+                grids = resp2.json().get("data", [])
+
+            if not grids:
+                # Fallback: any grid dimensions
+                grids_any_url = f"https://www.steamgriddb.com/api/v2/grids/game/{sgdb_id}"
+                resp2b = _requests.get(grids_any_url, headers=headers, timeout=10)
+                if resp2b.status_code != 200:
+                    ss.log.warning(f"SGDB grids HTTP {resp2b.status_code} for '{game_name}' (id={sgdb_id})")
+                    return False
+                grids = resp2b.json().get("data", [])
+
+            if not grids:
+                ss.log.info(f"SGDB: no grid art found for '{game_name}' (id={sgdb_id})")
+                return False
+
+            thumb_url = grids[0].get("thumb") or grids[0].get("url", "")
+            if not thumb_url:
+                ss.log.warning(f"SGDB: grid entry has no url for '{game_name}'")
+                return False
+
+            # Step 3: download the thumbnail image
+            img_resp = _requests.get(thumb_url, timeout=15)
+            if img_resp.status_code != 200:
+                return False
+
+            # Determine filename from hash of the game name
+            name_hash = hashlib.md5(game_name.encode("utf-8")).hexdigest()[:12]
+            # Detect extension from Content-Type or URL
+            ct = img_resp.headers.get("Content-Type", "")
+            if "png" in ct or thumb_url.endswith(".png"):
+                ext = "png"
+            elif "webp" in ct or thumb_url.endswith(".webp"):
+                ext = "webp"
+            else:
+                ext = "jpg"
+            filename = f"{name_hash}.{ext}"
+            filepath = THUMB_CACHE_DIR / filename
+
+            filepath.write_bytes(img_resp.content)
+
+            # Convert to PNG if not already (ensures PIL can always open it)
+            if ext != "png":
+                try:
+                    pil_img = Image.open(filepath).convert("RGB")
+                    png_name = f"{name_hash}.png"
+                    png_path = THUMB_CACHE_DIR / png_name
+                    pil_img.save(png_path, "PNG")
+                    filepath.unlink(missing_ok=True)
+                    filename = png_name
+                except Exception:
+                    pass  # keep original format
+
+            # Update index
+            with self._lock:
+                self._index[game_name] = {
+                    "sgdb_id": sgdb_id,
+                    "thumb_url": thumb_url,
+                    "filename": filename,
+                }
+                # Clear the CTkImage cache so it gets re-built from new file
+                self._ctk_cache.pop(game_name, None)
+                self._save_index()
+
+            return True
+
+        except Exception as _e:
+            ss.log.error(f"SGDB fetch_thumbnail exception for '{game_name}': {_e}", exc_info=True)
+            return False
+
+    def prefetch_all(self, game_names):
+        """Fetch thumbnails for all games that are not cached yet.  Blocking."""
+        for name in game_names:
+            entry = self._index.get(name)
+            if entry and (THUMB_CACHE_DIR / entry.get("filename", "")).exists():
+                continue
+            self.fetch_thumbnail(name)
+
+    def invalidate(self, game_name: str):
+        """Remove cached thumbnail for a game (e.g. when renamed)."""
+        with self._lock:
+            entry = self._index.pop(game_name, None)
+            self._ctk_cache.pop(game_name, None)
+            self._ctk_cache.pop(f"__placeholder__{game_name}", None)
+            if entry:
+                fp = THUMB_CACHE_DIR / entry.get("filename", "")
+                fp.unlink(missing_ok=True)
+                self._save_index()
+
+    # ── Internal helpers ──────────────────────────────────────
+    @staticmethod
+    def _fit_cover(img: Image.Image, target_size: tuple) -> Image.Image:
+        """Resize and center-crop to fill target_size exactly."""
+        tw, th = target_size
+        iw, ih = img.size
+        # Scale to cover
+        scale = max(tw / iw, th / ih)
+        new_w, new_h = int(iw * scale), int(ih * scale)
+        img = img.resize((new_w, new_h), Image.LANCZOS)
+        # Center crop
+        left = (new_w - tw) // 2
+        top = (new_h - th) // 2
+        img = img.crop((left, top, left + tw, top + th))
+        return img
+
+
+# Singleton instance — created once, shared across the app
+_thumb_mgr = ThumbnailManager()
+
+
+def _relative_time(iso_ts: str) -> str:
+    """Convert an ISO timestamp to a human-readable relative time like '2h ago'."""
+    if not iso_ts:
+        return "never"
+    try:
+        from datetime import datetime, timezone
+        dt = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
+        now = datetime.now(timezone.utc)
+        diff = now - dt
+        secs = int(diff.total_seconds())
+        if secs < 60:
+            return "just now"
+        mins = secs // 60
+        if mins < 60:
+            return f"{mins}m ago"
+        hours = mins // 60
+        if hours < 24:
+            return f"{hours}h ago"
+        days = hours // 24
+        if days < 30:
+            return f"{days}d ago"
+        months = days // 30
+        return f"{months}mo ago"
+    except Exception:
+        return "unknown"
 
 
 # ---------------------------------------------------------------
@@ -123,7 +425,7 @@ class SaveSyncApp(ctk.CTk):
         self.minsize(880, 580)
 
         # ── State ──────────────────────────────────────────────
-        self.watcher: ss.GameWatcher | None = None
+        self.watcher = None  # type: ss.GameWatcher or None
         self.watcher_running = False
         self.active_nav: str = ""
         self._tray_icon = None
@@ -134,25 +436,27 @@ class SaveSyncApp(ctk.CTk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         # ── Grid: sidebar (col 0, fixed) | content (col 1, expand)
-        self.grid_columnconfigure(0, weight=0, minsize=220)
+        self.grid_columnconfigure(0, weight=0, minsize=200)
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=0)   # status bar
 
         # ── Sidebar ───────────────────────────────────────────
-        self.sidebar = ctk.CTkFrame(self, width=220, corner_radius=0)
+        self.sidebar = ctk.CTkFrame(self, width=200, corner_radius=0,
+                                     fg_color=COL_BG_SIDEBAR)
         self.sidebar.grid(row=0, column=0, rowspan=2, sticky="nsew")
         self.sidebar.grid_propagate(False)
         self._build_sidebar()
 
         # ── Content area ──────────────────────────────────────
-        self.content = ctk.CTkFrame(self, corner_radius=0, fg_color="transparent")
+        self.content = ctk.CTkFrame(self, corner_radius=0, fg_color=COL_BG_DARK)
         self.content.grid(row=0, column=1, sticky="nsew", padx=0, pady=0)
         self.content.grid_columnconfigure(0, weight=1)
         self.content.grid_rowconfigure(0, weight=1)
 
         # ── Status bar ────────────────────────────────────────
-        self.statusbar = ctk.CTkFrame(self, height=28, corner_radius=0)
+        self.statusbar = ctk.CTkFrame(self, height=28, corner_radius=0,
+                                       fg_color=COL_BG_DARK)
         self.statusbar.grid(row=1, column=1, sticky="ew")
         self.statusbar.grid_propagate(False)
         self._build_statusbar()
@@ -163,12 +467,20 @@ class SaveSyncApp(ctk.CTk):
         # ── Background: check manifest update ─────────────────
         threading.Thread(target=ss.check_manifest_update_silently, daemon=True).start()
 
+        # ── Background: prefetch thumbnails for all games ─────
+        self._prefetch_thumbnails()
+
         # ── Periodic status refresh ───────────────────────────
         self._refresh_status()
 
         # ── --minimized: auto-start watcher and hide to tray ──
         if self._start_minimized:
             self.after(200, self._auto_start_minimized)
+        else:
+            # Explicitly ensure the window is visible and on top
+            self.deiconify()
+            self.lift()
+            self.focus_force()
 
     # -----------------------------------------------------------
     # System tray (minimize-to-tray on close)
@@ -299,6 +611,35 @@ class SaveSyncApp(ctk.CTk):
         except Exception as e:
             ss.log.error(f"Startup health check failed: {e}")
 
+    # -----------------------------------------------------------
+    # Thumbnail prefetching
+    # -----------------------------------------------------------
+    def _prefetch_thumbnails(self):
+        """Fetch thumbnails for all configured games in the background.
+        When done, refresh the games panel if it's currently visible."""
+        cfg = ss.load_config()
+        game_names = [g["name"] for g in cfg.get("games", [])]
+        if not game_names:
+            return
+
+        def _worker():
+            _thumb_mgr.prefetch_all(game_names)
+            # After fetching, refresh the panel on the main thread.
+            # Use try/except because .after() can fail if called before
+            # mainloop starts or after the window is destroyed.
+            try:
+                self.after(100, self._refresh_games_if_active)
+            except RuntimeError:
+                pass
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _refresh_games_if_active(self):
+        """Rebuild the games panel (thumbnails updated) and re-show if active."""
+        self._invalidate_panel("games")
+        if self.active_nav == "games":
+            self.show_panel("games")
+
     def _on_close(self):
         """When user clicks X: hide to tray instead of quitting."""
         if TRAY_AVAILABLE:
@@ -374,47 +715,38 @@ class SaveSyncApp(ctk.CTk):
     # Sidebar
     # -----------------------------------------------------------
     def _build_sidebar(self):
-        # Logo / title
-        logo = ctk.CTkLabel(self.sidebar, text="SaveSync",
-                            font=("Segoe UI", 22, "bold"),
-                            text_color=COL_ACCENT)
-        logo.pack(pady=(24, 4))
-        sub = ctk.CTkLabel(self.sidebar, text="Game Save Backup Manager",
-                           font=FONT_SMALL, text_color=COL_TEXT_DIM)
-        sub.pack(pady=(0, 20))
+        # Logo / title — centred
+        logo_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        logo_frame.pack(fill="x", padx=20, pady=(20, 24))
+        ctk.CTkLabel(logo_frame, text="SaveSync",
+                     font=("Segoe UI", 18, "bold"),
+                     text_color=COL_ACCENT).pack(anchor="center")
+        ctk.CTkLabel(logo_frame, text="Game Save Manager",
+                     font=FONT_SMALL, text_color=COL_TEXT_DIM).pack(anchor="center", pady=(2, 0))
 
-        sep = ctk.CTkFrame(self.sidebar, height=1, fg_color=COL_TEXT_DIM)
-        sep.pack(fill="x", padx=16, pady=(0, 12))
-
-        self.nav_buttons: dict[str, ctk.CTkButton] = {}
+        self.nav_buttons = {}  # str -> ctk.CTkButton
         nav_items = [
-            ("games",     "Games"),
-            ("restore",   "Restore"),
-            ("watcher",   "Watcher"),
-            ("settings",  "Settings"),
+            ("games",    "Games"),
+            ("watcher",  "Watcher"),
+            ("settings", "Settings"),
         ]
         for key, label in nav_items:
             btn = ctk.CTkButton(
-                self.sidebar, text=f"  {label}", anchor="w",
-                font=FONT_BODY, height=38, corner_radius=8,
-                fg_color="transparent", text_color=COL_TEXT,
-                hover_color=COL_ACCENT_HVR,
+                self.sidebar, text=label, anchor="center",
+                font=("Segoe UI", 15, "bold"), height=48, corner_radius=8,
+                fg_color="transparent", text_color=COL_TEXT_MID,
+                hover_color="#1a2245",
                 command=lambda k=key: self.show_panel(k),
             )
-            btn.pack(fill="x", padx=12, pady=2)
+            btn.pack(fill="x", pady=2, padx=10)
             self.nav_buttons[key] = btn
-
-        # Watcher status dot (updated periodically)
-        self.watcher_dot = ctk.CTkLabel(self.sidebar, text="",
-                                        font=FONT_SMALL, text_color=COL_TEXT_DIM)
-        self.watcher_dot.pack(side="bottom", pady=(0, 12))
 
     def _highlight_nav(self, key: str):
         for k, btn in self.nav_buttons.items():
             if k == key:
-                btn.configure(fg_color=COL_ACCENT, text_color="#ffffff")
+                btn.configure(fg_color="#1e2a50", text_color=COL_ACCENT)
             else:
-                btn.configure(fg_color="transparent", text_color=COL_TEXT)
+                btn.configure(fg_color="transparent", text_color=COL_TEXT_MID)
 
     # -----------------------------------------------------------
     # Status bar
@@ -448,10 +780,8 @@ class SaveSyncApp(ctk.CTk):
         # Watcher state
         if self.watcher_running:
             self.lbl_status_watcher.configure(text="Watcher: running", text_color=COL_SUCCESS)
-            self.watcher_dot.configure(text="● Watcher active", text_color=COL_SUCCESS)
         else:
             self.lbl_status_watcher.configure(text="Watcher: stopped", text_color=COL_TEXT_DIM)
-            self.watcher_dot.configure(text="○ Watcher stopped", text_color=COL_TEXT_DIM)
 
         # DB update available?
         meta = ss._load_manifest_meta()
@@ -463,49 +793,111 @@ class SaveSyncApp(ctk.CTk):
         self.after(5000, self._refresh_status)
 
     # -----------------------------------------------------------
-    # Panel switching
+    # Panel switching — cached so switching tabs is instant
     # -----------------------------------------------------------
     def show_panel(self, name: str):
-        """Destroy current content children and build the requested panel."""
+        """Show a panel by name.  Panels are built once and cached;
+        switching between them is O(1) — no widget rebuild."""
+        if not hasattr(self, "_panel_cache"):
+            self._panel_cache = {}
+
         self.active_nav = name
         self._highlight_nav(name)
-        for w in self.content.winfo_children():
-            w.destroy()
 
+        # Hide every cached panel
+        for frame in self._panel_cache.values():
+            try:
+                frame.pack_forget()
+            except Exception:
+                pass
+
+        # If cached (and not stale), just re-pack it
+        if name in self._panel_cache:
+            try:
+                self._panel_cache[name].pack(fill="both", expand=True)
+                return
+            except Exception:
+                del self._panel_cache[name]  # stale; fall through to rebuild
+
+        # Build fresh
         builders = {
             "games":    self._panel_games,
-            "restore":  self._panel_restore,
             "watcher":  self._panel_watcher,
             "settings": self._panel_settings,
         }
         builder = builders.get(name)
         if builder:
-            builder()
+            try:
+                builder()
+            except Exception as e:
+                ss.log.error(f"Panel '{name}' failed to render: {e}", exc_info=True)
+                err_frame = ctk.CTkFrame(self.content, fg_color="transparent")
+                err_frame.pack(fill="both", expand=True)
+                ctk.CTkLabel(err_frame,
+                             text=f"Error loading panel '{name}':\n{e}",
+                             font=FONT_BODY, text_color=COL_ERROR
+                             ).pack(padx=20, pady=40)
+                self._panel_cache[name] = err_frame
+                return
+
+        # Stash whichever frame was just packed into self.content
+        children = [w for w in self.content.winfo_children()
+                    if str(w.winfo_manager()) == "pack"]
+        if children:
+            self._panel_cache[name] = children[-1]
+
+    def _invalidate_panel(self, name: str):
+        """Mark a panel as stale so it is rebuilt on next visit."""
+        if not hasattr(self, "_panel_cache"):
+            return
+        old = self._panel_cache.pop(name, None)
+        if old:
+            try:
+                old.destroy()
+            except Exception:
+                pass
 
     # ===============================================================
     #  PANEL: Games
     # ===============================================================
+    # ── Grid helper: wrap cards into rows ────────────────────
+    CARD_WIDTH  = 220   # px per card (matches mockup minmax)
+    CARD_GAP    = 16    # px gap between cards
+
     def _panel_games(self):
-        frame = ctk.CTkFrame(self.content, fg_color="transparent")
-        frame.pack(fill="both", expand=True, padx=20, pady=16)
+        # Outer wrapper fills the content area
+        wrapper = ctk.CTkFrame(self.content, fg_color="transparent")
+        wrapper.pack(fill="both", expand=True)
 
-        # Header row
-        hdr = ctk.CTkFrame(frame, fg_color="transparent")
-        hdr.pack(fill="x", pady=(0, 12))
-        ctk.CTkLabel(hdr, text="My Games", font=FONT_TITLE).pack(side="left")
+        # ── Top bar: title + action buttons ─────────────────
+        topbar = ctk.CTkFrame(wrapper, fg_color="transparent", height=52)
+        topbar.pack(fill="x", padx=24, pady=(16, 0))
+        topbar.pack_propagate(False)
 
-        btn_row = ctk.CTkFrame(hdr, fg_color="transparent")
-        btn_row.pack(side="right")
-        ctk.CTkButton(btn_row, text="Add from Drive", width=150, font=FONT_BODY,
-                       fg_color="gray30", hover_color="gray40",
+        ctk.CTkLabel(topbar, text="My Games", font=FONT_TITLE,
+                     text_color=COL_TEXT).pack(side="left", anchor="w")
+
+        btn_row = ctk.CTkFrame(topbar, fg_color="transparent")
+        btn_row.pack(side="right", anchor="e")
+        ctk.CTkButton(btn_row, text="Add from Drive", width=130, height=32,
+                       font=("Segoe UI", 12, "bold"),
+                       fg_color=COL_BTN_GHOST, hover_color="#222a42",
+                       text_color=COL_TEXT_MID, corner_radius=8,
                        command=self._add_from_drive).pack(side="left", padx=(0, 8))
-        ctk.CTkButton(btn_row, text="+ Add Game", width=120, font=FONT_BODY,
+        ctk.CTkButton(btn_row, text="+ Add Game", width=110, height=32,
+                       font=("Segoe UI", 12, "bold"),
                        fg_color=COL_ACCENT, hover_color=COL_ACCENT_HVR,
+                       text_color="#ffffff", corner_radius=8,
                        command=self._open_add_game_dialog).pack(side="left")
 
-        # Scrollable game list
-        scroll = ctk.CTkScrollableFrame(frame, fg_color="transparent")
-        scroll.pack(fill="both", expand=True)
+        # ── Scrollable grid area ────────────────────────────
+        scroll = ctk.CTkScrollableFrame(
+            wrapper, fg_color="transparent",
+            scrollbar_fg_color=COL_BG_DARK,             # track blends into bg
+            scrollbar_button_color="#4a5580",           # clearly visible thumb
+            scrollbar_button_hover_color=COL_ACCENT,    # purple on hover
+        )
+        scroll.pack(fill="both", expand=True, padx=24, pady=(16, 8))
 
         cfg = ss.load_config()
         games = cfg.get("games", [])
@@ -515,71 +907,223 @@ class SaveSyncApp(ctk.CTk):
                          font=FONT_BODY, text_color=COL_TEXT_DIM).pack(pady=40)
             return
 
-        for g in games:
-            self._game_card(scroll, g)
+        # Store scroll reference so we can re-layout on resize
+        self._games_scroll = scroll
+        self._games_list = games
+        self._grid_cols = 0  # force fresh layout
 
-    def _game_card(self, parent, game: dict):
-        """Render a single game card."""
-        card = ctk.CTkFrame(parent, corner_radius=10, border_width=1,
-                            border_color=COL_TEXT_DIM)
-        card.pack(fill="x", pady=4, padx=2)
+        # Build cards into a grid via a frame that re-flows
+        self._grid_frame = ctk.CTkFrame(scroll, fg_color="transparent")
+        self._grid_frame.pack(fill="x")
 
-        inner = ctk.CTkFrame(card, fg_color="transparent")
-        inner.pack(fill="x", padx=16, pady=12)
+        self._lay_out_game_grid()
 
-        # Name
-        ctk.CTkLabel(inner, text=game["name"], font=FONT_HEAD).pack(anchor="w")
+        # Re-layout when the scroll area resizes
+        scroll.bind("<Configure>", lambda e: self._lay_out_game_grid())
 
-        # Destinations
-        dests = []
-        if game.get("drive_folder"): dests.append("Drive")
-        if game.get("archive_path"): dests.append(".7z")
-        if game.get("local_copy"):   dests.append("Local")
-        dest_str = " · ".join(dests) if dests else "No destination"
+        # CTkScrollableFrame only enables scrolling when its canvas scrollregion
+        # is larger than the visible area.  The scrollregion is set via
+        # <Configure> on the inner frame, but that event may not fire after we
+        # populate the grid (timing).  Force a scrollregion refresh so CTk sees
+        # the true content height, enables the mouse wheel, and shows the thumb.
+        def _force_scrollregion():
+            try:
+                scroll.update_idletasks()
+                canvas = scroll._parent_canvas
+                canvas.configure(scrollregion=canvas.bbox("all"))
+            except Exception:
+                pass
+        scroll.after(300, _force_scrollregion)
 
-        # Last backup
+    def _lay_out_game_grid(self):
+        """(Re-)arrange game cards in a responsive grid inside _grid_frame."""
+        frame = self._grid_frame
+        games = self._games_list
+
+        # Determine number of columns from available width
+        try:
+            avail = self._games_scroll.winfo_width()
+        except Exception:
+            avail = 700
+        if avail < 100:
+            avail = 700  # first render fallback
+
+        cols = max(1, (avail + self.CARD_GAP) // (self.CARD_WIDTH + self.CARD_GAP))
+
+        # Only rebuild if column count changed (or first time)
+        if hasattr(self, "_grid_cols") and self._grid_cols == cols:
+            return
+        self._grid_cols = cols
+
+        # Clear existing children
+        for w in frame.winfo_children():
+            w.destroy()
+
+        # Columns share space equally; cards keep natural width (sticky="n")
+        for c in range(cols):
+            frame.grid_columnconfigure(c, weight=1)
+
+        # Place cards — sticky="n" keeps card at its natural width, centred in cell
+        for idx, game in enumerate(games):
+            r, c = divmod(idx, cols)
+            card = self._game_card(frame, game)
+            card.grid(row=r, column=c, padx=self.CARD_GAP // 2,
+                      pady=self.CARD_GAP // 2, sticky="n")
+
+        # After rebuilding cards, force scrollregion update + reset to top
+        if hasattr(self, "_games_scroll"):
+            def _refresh_scroll():
+                try:
+                    scroll = self._games_scroll
+                    scroll.update_idletasks()
+                    canvas = scroll._parent_canvas
+                    canvas.configure(scrollregion=canvas.bbox("all"))
+                    canvas.yview_moveto(0.0)
+                except Exception:
+                    pass
+            frame.after(100, _refresh_scroll)
+
+    def _game_card(self, parent, game: dict) -> ctk.CTkFrame:
+        """Render a single game card — vertical layout matching the mockup:
+        thumbnail (top, 3:2) → name → relative time → badges → action buttons."""
+        card = ctk.CTkFrame(parent, corner_radius=12, border_width=1,
+                            fg_color=COL_BG_CARD,
+                            border_color=COL_BORDER)
+        # Hover effect — bind to card and all children so every pixel triggers it
+        def _on_enter(e):
+            card.configure(border_color=COL_ACCENT)
+
+        def _on_leave(e):
+            # Only deactivate when the mouse truly leaves the card boundary
+            wx, wy = card.winfo_rootx(), card.winfo_rooty()
+            ww, wh = card.winfo_width(), card.winfo_height()
+            mx, my = card.winfo_pointerx(), card.winfo_pointery()
+            if not (wx <= mx < wx + ww and wy <= my < wy + wh):
+                card.configure(border_color=COL_BORDER)
+
+        def _bind_hover(widget):
+            widget.bind("<Enter>", _on_enter, add="+")
+            widget.bind("<Leave>", _on_leave, add="+")
+            for child in widget.winfo_children():
+                _bind_hover(child)
+
+        # Defer until card is fully built so all children exist
+        card.after(0, lambda: _bind_hover(card))
+
+        # ── Thumbnail area (full card width, fixed height = 3:2) ──
+        thumb_img = _thumb_mgr.get_thumbnail(game["name"])
+        if thumb_img is not None:
+            # Real cover art — let CTkImage define size (220×146), centred in card
+            ctk.CTkLabel(card, text="", image=thumb_img,
+                         corner_radius=0).pack(pady=0)
+        else:
+            # Pure-CTk placeholder — fixed size matches THUMB_SIZE, no PIL/DIB risk
+            ph_color = _thumb_mgr.placeholder_color(game["name"])
+            initials = _thumb_mgr.placeholder_initials(game["name"])
+            ph_frame = ctk.CTkFrame(card, fg_color=ph_color,
+                                    width=THUMB_SIZE[0], height=THUMB_SIZE[1],
+                                    corner_radius=0)
+            ph_frame.pack(pady=0)
+            ph_frame.pack_propagate(False)
+            ctk.CTkLabel(ph_frame, text=initials,
+                         font=("Segoe UI", 30, "bold"),
+                         text_color="#ffffff",
+                         fg_color="transparent").pack(expand=True)
+
+        # ── Info section (padded) ───────────────────────────
+        info = ctk.CTkFrame(card, fg_color="transparent")
+        info.pack(fill="x", padx=12, pady=(10, 12))
+
+        # Game name (truncated)
+        ctk.CTkLabel(info, text=game["name"], font=FONT_HEAD,
+                     text_color=COL_TEXT, anchor="w").pack(fill="x")
+
+        # Relative time
         ts = game.get("backup_timestamp", "")
-        ts_str = ss.fmt_ts(ts) if ts else "never"
+        rel = _relative_time(ts)
+        time_frame = ctk.CTkFrame(info, fg_color="transparent")
+        time_frame.pack(fill="x", pady=(2, 0))
+        ctk.CTkLabel(time_frame, text="Last sync ", font=FONT_TINY,
+                     text_color=COL_TEXT_DIM, anchor="w").pack(side="left")
+        ctk.CTkLabel(time_frame, text=rel, font=FONT_TINY,
+                     text_color=COL_SUCCESS, anchor="w").pack(side="left")
 
-        info = f"Backup to: {dest_str}   |   Last: {ts_str}"
-        ctk.CTkLabel(inner, text=info, font=FONT_SMALL,
-                     text_color=COL_TEXT_DIM).pack(anchor="w", pady=(2, 0))
+        # ── Badges row ──────────────────────────────────────
+        badge_row = ctk.CTkFrame(info, fg_color="transparent")
+        badge_row.pack(fill="x", pady=(8, 0))
 
-        # Save path
-        ctk.CTkLabel(inner, text=game.get("save_path", ""),
-                     font=FONT_MONO, text_color=COL_TEXT_DIM).pack(anchor="w", pady=(2, 0))
+        def _badge(parent_fr, text, bg, fg):
+            b = ctk.CTkLabel(parent_fr, text=text, font=("Segoe UI", 10, "bold"),
+                             fg_color=bg, text_color=fg, corner_radius=4,
+                             width=0, height=20)
+            b.pack(side="left", padx=(0, 5))
 
-        # Watcher info
-        if game.get("exe_name"):
-            triggers = []
-            if game.get("trigger_launch"): triggers.append("on launch")
-            if game.get("trigger_close"):  triggers.append("on close")
-            iv = game.get("interval_min", 0)
-            if iv: triggers.append(f"every {iv} min")
-            trig_str = ", ".join(triggers) if triggers else "manual only"
-            ctk.CTkLabel(inner, text=f"Watches: {game['exe_name']}  ({trig_str})",
-                         font=FONT_SMALL, text_color=COL_TEXT_DIM).pack(anchor="w", pady=(2, 0))
+        if game.get("drive_folder"):
+            _badge(badge_row, "Drive", COL_BADGE_DRIVE_BG, COL_BADGE_DRIVE_FG)
+        if game.get("archive_path"):
+            _badge(badge_row, ".7z", COL_BADGE_7Z_BG, COL_BADGE_7Z_FG)
 
-        # Action buttons
-        btn_row = ctk.CTkFrame(inner, fg_color="transparent")
-        btn_row.pack(anchor="e", pady=(6, 0))
-        ctk.CTkButton(btn_row, text="Remove", width=80, height=28,
-                       font=FONT_SMALL, fg_color=COL_ERROR,
-                       hover_color="#dc2626",
-                       command=lambda g=game: self._remove_game(g)).pack(side="right")
-        ctk.CTkButton(btn_row, text="Edit", width=80, height=28,
-                       font=FONT_SMALL, fg_color=COL_WARNING,
-                       hover_color="#d97706",
-                       command=lambda g=game: self._edit_game(g)).pack(side="right", padx=(0, 6))
-        ctk.CTkButton(btn_row, text="Backup", width=80, height=28,
-                       font=FONT_SMALL, fg_color=COL_ACCENT,
-                       hover_color=COL_ACCENT_HVR,
-                       command=lambda g=game: self._quick_backup(g)).pack(side="right", padx=(0, 6))
+        # Trigger badge
+        iv = game.get("interval_min", 0)
+        if iv:
+            _badge(badge_row, f"{iv} min", COL_BADGE_AUTO_BG, COL_BADGE_AUTO_FG)
+        elif game.get("trigger_close"):
+            _badge(badge_row, "on close", COL_BADGE_AUTO_BG, COL_BADGE_AUTO_FG)
+        elif game.get("trigger_launch"):
+            _badge(badge_row, "on launch", COL_BADGE_AUTO_BG, COL_BADGE_AUTO_FG)
+
+        # ── Action buttons row — always exactly 2 buttons ───
+        btn_row = ctk.CTkFrame(info, fg_color="transparent")
+        btn_row.pack(fill="x", pady=(10, 0))
+
+        # Primary button: Sync (if Drive) or Backup (otherwise)
         if game.get("drive_folder") and ss.GDRIVE_AVAILABLE:
-            ctk.CTkButton(btn_row, text="Sync", width=80, height=28,
-                           font=FONT_SMALL, fg_color="#7c3aed",
-                           hover_color="#6d28d9",
-                           command=lambda g=game: self._sync_game(g)).pack(side="right", padx=(0, 6))
+            ctk.CTkButton(btn_row, text="Sync", height=30,
+                          font=("Segoe UI", 11, "bold"),
+                          fg_color=COL_ACCENT, hover_color=COL_ACCENT_HVR,
+                          text_color="#ffffff", corner_radius=6,
+                          command=lambda g=game: self._sync_game(g)
+                          ).pack(side="left", fill="x", expand=True, padx=(0, 4))
+        else:
+            ctk.CTkButton(btn_row, text="Backup", height=30,
+                          font=("Segoe UI", 11, "bold"),
+                          fg_color=COL_BTN_GHOST, hover_color="#222a42",
+                          text_color=COL_TEXT_MID, corner_radius=6,
+                          command=lambda g=game: self._quick_backup(g)
+                          ).pack(side="left", fill="x", expand=True, padx=(0, 4))
+
+        # ··· menu button — fixed width, always visible
+        more_btn = ctk.CTkButton(btn_row, text="···", width=36, height=30,
+                                 font=("Segoe UI", 13, "bold"),
+                                 fg_color=COL_BTN_GHOST, hover_color="#222a42",
+                                 text_color=COL_TEXT_MID, corner_radius=6,
+                                 command=lambda g=game, b=None: None)
+        more_btn.pack(side="left")
+        more_btn.configure(
+            command=lambda g=game, mb=more_btn: self._show_card_menu(g, mb)
+        )
+
+        return card
+
+    def _show_card_menu(self, game: dict, anchor_widget):
+        """Dropdown from the ··· button: Backup, Edit, Remove."""
+        menu = tk.Menu(self, tearoff=0, font=("Segoe UI", 11),
+                       bg="#1a2035", fg=COL_TEXT, activebackground=COL_ACCENT,
+                       activeforeground="#ffffff", relief="flat", bd=0)
+        menu.add_command(label="  Backup now  ",
+                         command=lambda: self._quick_backup(game))
+        menu.add_command(label="  Edit  ",
+                         command=lambda: self._edit_game(game))
+        menu.add_separator()
+        menu.add_command(label="  Remove  ",
+                         command=lambda: self._remove_game(game))
+        # Position the menu below the ··· button
+        try:
+            x = anchor_widget.winfo_rootx()
+            y = anchor_widget.winfo_rooty() + anchor_widget.winfo_height()
+            menu.tk_popup(x, y)
+        except Exception:
+            menu.tk_popup(self.winfo_pointerx(), self.winfo_pointery())
 
     def _remove_game(self, game: dict):
         if not messagebox.askyesno(
@@ -594,6 +1138,7 @@ class SaveSyncApp(ctk.CTk):
         cfg["games"] = [g for g in cfg["games"] if g["name"] != game["name"]]
         ss.save_config(cfg)
         ss.log.info(f"Removed game: {game['name']}")
+        self._invalidate_panel("games")
         self.show_panel("games")
 
     def _edit_game(self, game: dict):
@@ -847,6 +1392,7 @@ class SaveSyncApp(ctk.CTk):
         def _on_close():
             win.destroy()
             if self.active_nav == "games":
+                self._invalidate_panel("games")
                 self.show_panel("games")
         win.protocol("WM_DELETE_WINDOW", _on_close)
 
@@ -1073,6 +1619,7 @@ class SaveSyncApp(ctk.CTk):
 
             messagebox.showinfo("Add All Complete", msg, parent=parent_win)
             parent_win.destroy()
+            self._invalidate_panel("games")
             self.show_panel("games")
 
         def _err(e):
@@ -1175,6 +1722,7 @@ class SaveSyncApp(ctk.CTk):
             # Refresh games panel when dialog closes
             def _on_parent_close():
                 parent_win.destroy()
+                self._invalidate_panel("games")
                 self.show_panel("games")
             parent_win.protocol("WM_DELETE_WINDOW", _on_parent_close)
 
@@ -2325,6 +2873,7 @@ class BackupDialog(ctk.CTkToplevel):
             def _on_close():
                 self.destroy()
                 if self.app.active_nav == "games":
+                    self.app._invalidate_panel("games")
                     self.app.show_panel("games")
             self.protocol("WM_DELETE_WINDOW", _on_close)
 
@@ -2561,6 +3110,12 @@ class EditGameDialog(ctk.CTkToplevel):
         ss.save_config(cfg)
         ss.log.info(f"Updated game config: {new_name}")
 
+        # Re-fetch thumbnail if name changed
+        if new_name != self.original_name:
+            _thumb_mgr.invalidate(self.original_name)
+            threading.Thread(target=_thumb_mgr.fetch_thumbnail,
+                             args=(new_name,), daemon=True).start()
+
         # Restart watcher so it picks up the changes
         _, is_running, wcount = self.app._restart_watcher()
         watcher_msg = ""
@@ -2577,6 +3132,7 @@ class EditGameDialog(ctk.CTkToplevel):
                                 f"'{new_name}' updated successfully.{watcher_msg}",
                                 parent=self)
             self.destroy()
+            self.app._invalidate_panel("games")
             self.app.show_panel("games")
 
     def _upload_config_to_drive(self, game_entry: dict, watcher_msg: str = ""):
@@ -2617,6 +3173,7 @@ class EditGameDialog(ctk.CTkToplevel):
             if watcher_msg:
                 lbl2.configure(text=watcher_msg.strip(), text_color=COL_SUCCESS)
             prog_win.after(1500, lambda: [prog_win.destroy(), self.destroy(),
+                                           self.app._invalidate_panel("games"),
                                            self.app.show_panel("games")])
 
         def _err(e):
@@ -2626,6 +3183,7 @@ class EditGameDialog(ctk.CTkToplevel):
             if watcher_msg:
                 lbl2.configure(text=watcher_msg.strip(), text_color=COL_SUCCESS)
             prog_win.after(3000, lambda: [prog_win.destroy(), self.destroy(),
+                                           self.app._invalidate_panel("games"),
                                            self.app.show_panel("games")])
 
         run_in_thread(self, _do, _done, _err)
@@ -3205,6 +3763,11 @@ class PostAddStatusWindow(ctk.CTkToplevel):
             font=FONT_BODY, text_color=COL_TEXT_DIM)
         self.lbl_watcher.pack(anchor="w", pady=2)
 
+        self.lbl_thumb = ctk.CTkLabel(
+            self.status_frame, text="● Fetching cover art...",
+            font=FONT_BODY, text_color=COL_TEXT_DIM)
+        self.lbl_thumb.pack(anchor="w", pady=2)
+
         sep2 = ctk.CTkFrame(self, height=1, fg_color=COL_TEXT_DIM)
         sep2.pack(fill="x", padx=20, pady=12)
 
@@ -3297,7 +3860,31 @@ class PostAddStatusWindow(ctk.CTkToplevel):
                     text_color=COL_WARNING)
                 all_ok = False
 
+        # 5. Fetch thumbnail (async — don't block the UI)
+        self._all_ok = all_ok
+        self._fetch_thumb(game["name"])
+
+    def _fetch_thumb(self, game_name: str):
+        """Fetch thumbnail in background, then show final summary."""
+        def _worker():
+            ok = _thumb_mgr.fetch_thumbnail(game_name)
+            self.after(0, lambda: self._on_thumb_done(ok))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_thumb_done(self, found: bool):
+        game = self.game
+        if found:
+            self.lbl_thumb.configure(
+                text="✓ Cover art found and cached.",
+                text_color=COL_SUCCESS)
+        else:
+            self.lbl_thumb.configure(
+                text="○ No cover art found — using placeholder.",
+                text_color=COL_TEXT_DIM)
+
         # Summary
+        all_ok = self._all_ok
         if all_ok:
             self.lbl_summary.configure(
                 text=f"✓ '{game['name']}' added successfully. Everything is as it should be.",
@@ -3311,6 +3898,7 @@ class PostAddStatusWindow(ctk.CTkToplevel):
 
     def _close(self):
         self.destroy()
+        self.app._invalidate_panel("games")
         self.app.show_panel("games")
 
 
@@ -3329,5 +3917,26 @@ class PostAddStatusWindow(ctk.CTkToplevel):
 # ===============================================================
 
 if __name__ == "__main__":
-    app = SaveSyncApp()
-    app.mainloop()
+    try:
+        app = SaveSyncApp()
+        app.mainloop()
+    except Exception as _fatal:
+        # If pythonw is used, there's no console — write to a crash log
+        import traceback as _tb
+        _crash_log = Path(__file__).resolve().parent / "savesync_crash.log"
+        _crash_text = _tb.format_exc()
+        try:
+            _crash_log.write_text(
+                f"SaveSync GUI crashed at {datetime.datetime.now()}\n\n{_crash_text}",
+                encoding="utf-8")
+        except Exception:
+            pass
+        # Also try to show a messagebox (may fail if Tk itself is broken)
+        try:
+            import tkinter.messagebox as _mbox
+            _mbox.showerror("SaveSync — Fatal Error",
+                            f"SaveSync failed to start:\n\n{_fatal}\n\n"
+                            f"Details written to:\n{_crash_log}")
+        except Exception:
+            pass
+        raise

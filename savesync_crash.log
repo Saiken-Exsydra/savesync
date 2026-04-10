@@ -1,0 +1,22 @@
+SaveSync GUI crashed at 2026-04-08 16:50:21.889568
+
+Traceback (most recent call last):
+  File "C:\Users\Ksy'luer\Desktop\SaveSync\Savesync\savesync_gui.py", line 3824, in <module>
+    app = SaveSyncApp()
+  File "C:\Users\Ksy'luer\Desktop\SaveSync\Savesync\savesync_gui.py", line 475, in __init__
+    self.show_panel("games")
+    ~~~~~~~~~~~~~~~^^^^^^^^^
+  File "C:\Users\Ksy'luer\Desktop\SaveSync\Savesync\savesync_gui.py", line 810, in show_panel
+    self._highlight_nav(name)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "C:\Users\Ksy'luer\Desktop\SaveSync\Savesync\savesync_gui.py", line 755, in _highlight_nav
+    btn.configure(fg_color="transparent", text_color=COL_TEXT_MID,
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                  border_color="transparent")
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Ksy'luer\AppData\Local\Programs\Python\Python314\Lib\site-packages\customtkinter\windows\widgets\ctk_button.py", line 377, in configure
+    self._border_color = self._check_color_type(kwargs.pop("border_color"))
+                         ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Ksy'luer\AppData\Local\Programs\Python\Python314\Lib\site-packages\customtkinter\windows\widgets\appearance_mode\appearance_mode_base_class.py", line 55, in _check_color_type
+    raise ValueError(f"transparency is not allowed for this attribute")
+ValueError: transparency is not allowed for this attribute
