@@ -1,0 +1,33 @@
+# Personal config — contains your local paths and game list
+savesync_config.json
+
+# Google Drive credentials — never share these
+gdrive_credentials.json
+gdrive_token.json
+
+# Ludusavi database — downloaded automatically on first run
+ludusavi_manifest.yaml
+ludusavi_index.json
+ludusavi_meta.json
+
+# Logs
+savesync.log
+
+# Temporary files created during backup
+_savesync_game_config.json
+
+# Restore snapshots — personal backups
+restore_snapshots/
+
+# Archive files
+*.7z
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
