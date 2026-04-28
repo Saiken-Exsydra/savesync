@@ -32,7 +32,7 @@ CFG = ss.load_config()
 # Set DRIVE_SCAN_TRAP = True to record every QWidget.show() + subprocess launch
 # during a Drive scan into %USERPROFILE%\Desktop\savesync_scan_trap.log
 # Disable once the flashing window is identified.
-DRIVE_SCAN_TRAP = True
+DRIVE_SCAN_TRAP = False
 _TRAP_LOG = Path.home() / "Desktop" / "savesync_scan_trap.log"
 _trap_active = False  # unused now — trap runs always
 
@@ -117,7 +117,12 @@ C = {
     "autoFg":      "#3dd68c",
 }
 
-ASSETS_DIR = Path(__file__).parent / "assets"
+# Assets must come from the PyInstaller extraction folder when frozen, since
+# __file__ points inside the bundled .pyc archive that callers cannot read.
+if getattr(sys, "frozen", False):
+    ASSETS_DIR = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent)) / "assets"
+else:
+    ASSETS_DIR = Path(__file__).parent / "assets"
 
 def svg_icon(name: str, color: str, size: int = 18) -> QPixmap:
     """Render a named SVG from assets/ with the given hex color into a QPixmap."""
@@ -212,6 +217,43 @@ def card_colors(name):
     to_c   = QColor.fromHsv(hue, 50, 20)
     text_c = QColor.fromHsv(hue, 60, 190)
     return from_c, to_c, text_c
+
+
+def install_enter_to_advance(dialog, advance_callable):
+    """Wire Enter / Return on `dialog` to invoke `advance_callable`.
+
+    Skips when focus is in a multi-line text edit (where Enter inserts a
+    newline) or when a button currently has focus (let the user activate
+    the focused control instead). Esc still maps to reject() via Qt default.
+    """
+    _orig = dialog.keyPressEvent
+
+    def _kp(ev):
+        key = ev.key()
+        if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            mods = ev.modifiers()
+            # Ignore if a modifier (Shift/Ctrl/Alt) is held — preserve newline-in-textedit etc.
+            if mods & (Qt.KeyboardModifier.ShiftModifier | Qt.KeyboardModifier.ControlModifier
+                       | Qt.KeyboardModifier.AltModifier):
+                return _orig(ev)
+            fw = dialog.focusWidget()
+            # Multi-line edits: let Enter insert a newline.
+            if isinstance(fw, QTextEdit):
+                return _orig(ev)
+            # If a button has focus, let it click itself.
+            if isinstance(fw, (QPushButton, QToolButton)):
+                fw.click()
+                ev.accept()
+                return
+            try:
+                advance_callable()
+            except Exception:
+                pass
+            ev.accept()
+            return
+        return _orig(ev)
+
+    dialog.keyPressEvent = _kp
 
 # ── Thumbnail ────────────────────────────────────────────────────────────────
 SGDB_KEY   = "eef436c06c902672e16d69ba375c0cb7"
@@ -968,6 +1010,53 @@ def section_title(text):
     return w
 
 
+def section_title_with_info(text, tooltip):
+    """Like section_title() but adds a small (i) info badge that shows
+    `tooltip` on hover."""
+    w = QWidget()
+    w.setStyleSheet("background: transparent;")
+    l = QVBoxLayout(w)
+    l.setContentsMargins(0, 8, 0, 6)
+    l.setSpacing(0)
+
+    title_row = QHBoxLayout()
+    title_row.setContentsMargins(0, 0, 0, 0)
+    title_row.setSpacing(8)
+
+    lbl = QLabel(text.upper())
+    lbl.setStyleSheet(
+        f"color:{C['textDim']}; font-size:10px; font-weight:700; letter-spacing:1.2px;"
+    )
+    title_row.addWidget(lbl)
+
+    info = QToolButton()
+    info.setText("i")
+    info.setFixedSize(16, 16)
+    info.setCursor(Qt.CursorShape.PointingHandCursor)
+    info.setToolTip(tooltip)
+    info.setStyleSheet(
+        f"QToolButton {{ color:{C['textDim']};"
+        f" background:rgba(255,255,255,0.08);"
+        f" border:1px solid rgba(255,255,255,0.15);"
+        f" border-radius:8px;"
+        f" font-size:10px; font-weight:700; font-family:'Segoe UI'; }}"
+        f"QToolButton:hover {{ color:{C['accent']};"
+        f" border-color:{C['accent']}; }}"
+    )
+    info.clicked.connect(lambda: QToolTip.showText(
+        info.mapToGlobal(info.rect().bottomLeft()), tooltip, info
+    ))
+    title_row.addWidget(info)
+    title_row.addStretch()
+    l.addLayout(title_row)
+
+    sep = QFrame()
+    sep.setFixedHeight(1)
+    sep.setStyleSheet(f"background:rgba(255,255,255,0.06); margin-top:6px;")
+    l.addWidget(sep)
+    return w
+
+
 # ── DbSearchResultsDialog ─────────────────────────────────────────────────────
 class DbSearchResultsDialog(QDialog):
     """Shows Ludusavi database search results in a dedicated window."""
@@ -1043,6 +1132,8 @@ class DbSearchResultsDialog(QDialog):
 
         self._sig = pyqtSignal_standalone = None  # use QTimer trick via Worker
         self._run_search()
+
+        install_enter_to_advance(self, self.reject)
 
     def _run_search(self):
         q = self._query
@@ -1181,7 +1272,11 @@ class LudusaviDbDialog(QDialog):
         warn_icon = QLabel("⚠")
         warn_icon.setStyleSheet(f"color:{C['warning']}; font-size:13px;")
         warn_icon.setFixedWidth(16)
-        warn_txt = QLabel("This may take a few minutes on slow connections.")
+        warn_txt = QLabel(
+            "Indexing parses the full manifest and may appear frozen for "
+            "several seconds before progress updates begin — please wait."
+        )
+        warn_txt.setWordWrap(True)
         warn_txt.setStyleSheet(
             f"color:{C['warning']}; font-size:11px; font-style:italic;"
         )
@@ -1223,8 +1318,9 @@ class LudusaviDbDialog(QDialog):
         root.addWidget(idx_lbl)
         root.addSpacing(4)
         self._idx_bar = QProgressBar()
-        self._idx_bar.setRange(0, 100)
-        self._idx_bar.setValue(0)
+        # Start in indeterminate (busy) mode so the user sees motion during
+        # the YAML parse, which can take several seconds with no progress reports.
+        self._idx_bar.setRange(0, 0)
         self._idx_bar.setFixedHeight(6)
         self._idx_bar.setTextVisible(False)
         self._idx_bar.setStyleSheet(
@@ -1248,6 +1344,12 @@ class LudusaviDbDialog(QDialog):
         self._sig_dl_prog.connect(self._on_dl_prog)
         self._sig_idx_prog.connect(self._on_idx_prog)
         self._sig_done.connect(self._on_done)
+
+        # Enter closes the dialog once the Close button is enabled.
+        install_enter_to_advance(
+            self,
+            lambda: self.accept() if self._close_btn.isEnabled() else None,
+        )
 
     def showEvent(self, e):
         super().showEvent(e)
@@ -1286,7 +1388,12 @@ class LudusaviDbDialog(QDialog):
         self._status.setText(msg)
 
     def _on_idx_prog(self, pct, msg):
-        self._idx_bar.setValue(pct)
+        # Switch from indeterminate (busy) animation to determinate progress
+        # the first time real per-iteration progress arrives.
+        if pct > 0 and self._idx_bar.maximum() == 0:
+            self._idx_bar.setRange(0, 100)
+        if self._idx_bar.maximum() != 0:
+            self._idx_bar.setValue(pct)
         self._status.setText(msg)
 
     def _on_done(self, ok, msg):
@@ -1296,6 +1403,9 @@ class LudusaviDbDialog(QDialog):
         )
         if self._dl_bar:
             self._dl_bar.setValue(100)
+        # Restore determinate mode so the bar stops animating on completion.
+        if self._idx_bar.maximum() == 0:
+            self._idx_bar.setRange(0, 100)
         self._idx_bar.setValue(100)
         self._close_btn.setEnabled(True)
         self._x_btn.setEnabled(True)
@@ -1411,6 +1521,20 @@ class BackupDialog(QDialog):
         self._done_btn.clicked.connect(self.accept)
         self._done_btn.hide()
         root.addWidget(self._done_btn)
+
+        def _on_enter():
+            # If the backup finished, Enter closes the dialog. Otherwise it
+            # triggers the most useful default action (Drive when configured,
+            # else archive, else nothing).
+            if self._done_btn.isVisible():
+                self.accept()
+                return
+            if self._action_row.isVisible():
+                if self.game.get("drive_folder"):
+                    self._run("drive")
+                elif self.game.get("archive_path"):
+                    self._run("archive")
+        install_enter_to_advance(self, _on_enter)
 
     def _run(self, target):
         self._action_row.hide()
@@ -1635,6 +1759,13 @@ class SyncDialog(QDialog):
         self._done_btn.hide()
         root.addWidget(self._done_btn)
 
+        def _on_enter():
+            if self._done_btn.isVisible():
+                self.accept()
+            elif self._sync_btn.isVisible():
+                self._run()
+        install_enter_to_advance(self, _on_enter)
+
     def _run(self):
         self._sync_btn.hide()
         self._cancel_btn.hide()
@@ -1785,6 +1916,8 @@ class EditGameDialog(QDialog):
         foot.addWidget(s_btn)
         root.addLayout(foot)
 
+        install_enter_to_advance(self, self._save)
+
     def _toggle_btn(self, text, checked):
         b = QPushButton(text)
         b.setCheckable(True)
@@ -1931,6 +2064,12 @@ class AddGameWizard(QDialog):
             self._content.addWidget(pg)
 
         self._refresh()
+
+        # Enter advances to the next step / saves on the final step.
+        install_enter_to_advance(
+            self,
+            lambda: self._next_btn.click() if self._next_btn.isEnabled() else None,
+        )
 
     def _page_name(self):
         w = QWidget()
@@ -2967,6 +3106,8 @@ class _ConfirmDialog(QDialog):
         foot.addWidget(ok)
         root.addLayout(foot)
 
+        install_enter_to_advance(self, self.accept)
+
 
 # ── StartupTaskDialog ─────────────────────────────────────────────────────────
 class DriveImportDialog(QDialog):
@@ -3058,6 +3199,8 @@ class DriveImportDialog(QDialog):
         add.clicked.connect(self.accept)
         foot.addWidget(add)
         root.addLayout(foot)
+
+        install_enter_to_advance(self, self.accept)
 
     def selected_names(self):
         return [name for name, cb in self._checkboxes if cb.isChecked()]
@@ -3165,6 +3308,14 @@ class StartupTaskDialog(QDialog):
 
         self._refresh_status()
 
+        def _on_enter():
+            # Run the primary action — install if visible, otherwise remove.
+            if self._install_btn.isVisible() and self._install_btn.isEnabled():
+                self._install()
+            elif self._remove_btn.isVisible() and self._remove_btn.isEnabled():
+                self._remove()
+        install_enter_to_advance(self, _on_enter)
+
     # ── helpers ──────────────────────────────────────────────────────────────
 
     def _task_installed(self):
@@ -3200,11 +3351,18 @@ class StartupTaskDialog(QDialog):
             QMessageBox.warning(self, "Not supported", "Task Scheduler is only available on Windows.")
             return
 
-        py_path = Path(sys.executable)
-        pythonw = py_path.parent / "pythonw.exe"
-        if not pythonw.exists():
-            pythonw = py_path
-        script_path = Path(ss.__file__).resolve()
+        # When running as a PyInstaller EXE, schedule the EXE itself.
+        # Otherwise fall back to pythonw.exe + the script path.
+        if getattr(sys, "frozen", False):
+            exe_path = Path(sys.executable)
+            tr = f'"{exe_path}" --minimized'
+        else:
+            py_path = Path(sys.executable)
+            pythonw = py_path.parent / "pythonw.exe"
+            if not pythonw.exists():
+                pythonw = py_path
+            script_path = Path(ss.__file__).resolve()
+            tr = f'"{pythonw}" "{script_path}" --watch'
 
         # Remove existing first (ignore errors)
         subprocess.run(["schtasks", "/delete", "/tn", self._TASK, "/f"], capture_output=True)
@@ -3212,7 +3370,7 @@ class StartupTaskDialog(QDialog):
         cmd = [
             "schtasks", "/create",
             "/tn", self._TASK,
-            "/tr", f'"{pythonw}" "{script_path}" --watch',
+            "/tr", tr,
             "/sc", "ONLOGON",
             "/rl", "HIGHEST",
             "/f",
@@ -3376,6 +3534,14 @@ class HealthCheckDialog(QDialog):
         foot.addWidget(close_btn)
         done_l.addLayout(foot)
         self._stack.addWidget(done_w)
+
+        def _on_enter():
+            idx = self._stack.currentIndex()
+            if idx == 0:           # idle → run
+                self._run_check()
+            elif idx == 2:         # results → close
+                self.accept()
+        install_enter_to_advance(self, _on_enter)
 
     # ── scan ──────────────────────────────────────────────────────────────────
     def _run_check(self):
@@ -4031,10 +4197,13 @@ class RestorePanel(QWidget):
 
 # ── SettingsPanel ─────────────────────────────────────────────────────────────
 class SettingsPanel(QWidget):
+    _sig_db_status_refresh = pyqtSignal()
+
     def __init__(self, main_win, parent=None):
         super().__init__(parent)
         self.setObjectName("panel")
         self._main_win = main_win
+        self._sig_db_status_refresh.connect(self._refresh_db_status)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -4072,11 +4241,16 @@ class SettingsPanel(QWidget):
         self._drive_btn.clicked.connect(self._toggle_drive)
         self._drive_acct_lbl = QLabel("Not connected")
         self._drive_acct_lbl.setStyleSheet(f"font-size:11px; color:{C['textDim']};")
+        self._drive_err_lbl = QLabel("")
+        self._drive_err_lbl.setStyleSheet(f"font-size:11px; color:{C['error']};")
+        self._drive_err_lbl.setWordWrap(True)
+        self._drive_err_lbl.hide()
         row = QWidget(); row.setStyleSheet("background:transparent;")
         rl = QHBoxLayout(row); rl.setContentsMargins(0,13,0,13); rl.setSpacing(12)
         txt_col = QVBoxLayout(); txt_col.setSpacing(3)
         lbl = QLabel("Account"); lbl.setStyleSheet(f"font-size:13px; color:{C['text']}; font-weight:500;")
         txt_col.addWidget(lbl); txt_col.addWidget(self._drive_acct_lbl)
+        txt_col.addWidget(self._drive_err_lbl)
         rl.addLayout(txt_col, 1); rl.addWidget(self._drive_btn)
         dcl.addWidget(row)
         sep = QFrame(); sep.setFixedHeight(1); sep.setStyleSheet(f"background:{C['border']};")
@@ -4222,30 +4396,46 @@ class SettingsPanel(QWidget):
         il.addWidget(startup_group)
 
         # Ludusavi Database section
-        il.addWidget(section_title("Ludusavi Database"))
+        il.addWidget(section_title_with_info(
+            "Ludusavi Database",
+            "The Ludusavi database is a community-maintained list of save-file "
+            "locations for thousands of PC games (the same data used by the "
+            "Ludusavi backup tool). SaveSync downloads it from GitHub and uses "
+            "it to auto-suggest save paths when you add a new game, so you "
+            "rarely have to hunt them down yourself."
+        ))
         db_group = QWidget()
         db_group.setStyleSheet("background: transparent;")
         dbl = QVBoxLayout(db_group)
         dbl.setContentsMargins(0, 0, 0, 0)
         dbl.setSpacing(10)
 
-        age = ss.manifest_db_age()
-        age_txt = age if age else "not downloaded"
+        # Status (left) + action buttons (right) on a single row.
         db_info_row = QHBoxLayout()
-        status_lbl = QLabel(f"Status: {age_txt}")
-        status_lbl.setStyleSheet(f"color:{C['textMid']}; font-size:12px;")
-        db_info_row.addWidget(status_lbl)
-        db_info_row.addStretch()
+        db_info_row.setSpacing(12)
+        self._db_status_lbl = QLabel()
+        self._db_status_lbl.setTextFormat(Qt.TextFormat.RichText)
+        self._db_status_lbl.setStyleSheet(f"color:{C['textMid']}; font-size:12px;")
+        self._db_status_lbl.setWordWrap(True)
+        self._db_status_lbl.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        )
+        db_info_row.addWidget(self._db_status_lbl, 1)
         update_btn = btn_ghost("Download / Update", small=True)
         update_btn.clicked.connect(self._update_db)
-        db_info_row.addWidget(update_btn)
+        db_info_row.addWidget(update_btn, 0, Qt.AlignmentFlag.AlignVCenter)
         rebuild_btn = btn_ghost("Rebuild Index", small=True)
         rebuild_btn.clicked.connect(self._rebuild_index)
-        db_info_row.addWidget(rebuild_btn)
+        db_info_row.addWidget(rebuild_btn, 0, Qt.AlignmentFlag.AlignVCenter)
         dbl.addLayout(db_info_row)
+
+        self._refresh_db_status()
+        # Kick off a background remote-version check (no-op if already done today).
+        self._kick_db_update_check()
 
         # Search
         search_row = QHBoxLayout()
+        search_row.setSpacing(8)
         self._db_search = QLineEdit()
         self._db_search.setPlaceholderText("Search save location database…")
         search_row.addWidget(self._db_search, 1)
@@ -4384,8 +4574,15 @@ class SettingsPanel(QWidget):
             self._drive_btn.setText("Connect Drive")
             self._drive_acct_lbl.setText("Not connected")
             self._drive_acct_lbl.setStyleSheet(f"font-size:11px; color:{C['textDim']};")
+            self._drive_err_lbl.hide()
+            self._drive_err_lbl.setText("")
             show_toast("Drive disconnected.", "info", self._main_win)
         else:
+            # Clear any previous error and start a fresh attempt.
+            self._drive_err_lbl.hide()
+            self._drive_err_lbl.setText("")
+            self._drive_acct_lbl.setText("Opening browser for Google sign-in…")
+            self._drive_acct_lbl.setStyleSheet(f"font-size:11px; color:{C['textDim']};")
             self._drive_btn.setEnabled(False)
             self._drive_btn.setText("Connecting…")
             def _do():
@@ -4402,6 +4599,8 @@ class SettingsPanel(QWidget):
         self._drive_connected = True
         self._drive_btn.setEnabled(True)
         self._drive_btn.setText("Disconnect")
+        self._drive_err_lbl.hide()
+        self._drive_err_lbl.setText("")
         if email:
             self._drive_acct_lbl.setText(email)
             self._drive_acct_lbl.setStyleSheet(f"font-size:11px; color:{C['success']};")
@@ -4414,17 +4613,104 @@ class SettingsPanel(QWidget):
                 show_toast("Google Drive connected", "success", self._main_win)
 
     def _on_drive_error(self, e):
+        self._drive_connected = False
         self._drive_btn.setEnabled(True)
-        self._drive_btn.setText("Connect Drive")
-        show_toast(f"Drive auth error: {e}", "error", self._main_win)
+        self._drive_btn.setText("Retry Connect")
+        self._drive_acct_lbl.setText("Not connected")
+        self._drive_acct_lbl.setStyleSheet(f"font-size:11px; color:{C['textDim']};")
+
+        msg = str(e) or "unknown error"
+        low = msg.lower()
+        if any(k in low for k in ("access_denied", "denied", "cancel", "user closed",
+                                  "consent", "user did not")):
+            friendly = "Sign-in was cancelled or denied. Click Retry to try again."
+        elif any(k in low for k in ("timeout", "timed out")):
+            friendly = "Sign-in timed out before completing. Click Retry to try again."
+        elif "credentials" in low and "json" in low:
+            friendly = "gdrive_credentials.json is missing or invalid."
+        elif any(k in low for k in ("network", "connection", "resolve", "dns",
+                                    "unreachable", "ssl")):
+            friendly = f"Network error during sign-in: {msg}"
+        else:
+            friendly = f"Sign-in failed: {msg}"
+
+        self._drive_err_lbl.setText(friendly)
+        self._drive_err_lbl.show()
+        show_toast(friendly, "error", self._main_win)
+
+    def _refresh_db_status(self):
+        st = ss.manifest_db_status()
+        if not st["downloaded"]:
+            line1 = f"<b>Database:</b> <span style='color:{C['warning']};'>not downloaded</span>"
+        else:
+            line1 = f"<b>Database:</b> downloaded ({st['age']})"
+        if not st["indexed"]:
+            line2 = f"<b>Index:</b> <span style='color:{C['warning']};'>not built</span>"
+        else:
+            line2 = f"<b>Index:</b> {st['game_count']:,} games"
+        if st["update_available"]:
+            line3 = (f"<span style='color:{C['warning']};'>"
+                     f"⚠ Newer version available on GitHub.</span>")
+        elif st["downloaded"] and st["checked_today"]:
+            line3 = f"<span style='color:{C['success']};'>✓ Up to date</span>"
+        elif st["downloaded"]:
+            line3 = f"<span style='color:{C['textDim']};'>Update status not yet checked.</span>"
+        else:
+            line3 = ""
+        html = "<br>".join(p for p in (line1, line2, line3) if p)
+        self._db_status_lbl.setText(html)
+
+    def _kick_db_update_check(self):
+        def _run():
+            try:
+                ss.check_manifest_update_silently()
+            except Exception:
+                pass
+            self._sig_db_status_refresh.emit()
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _confirm(self, title: str, body: str) -> bool:
+        reply = QMessageBox.question(
+            self, title, body,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return reply == QMessageBox.StandardButton.Yes
 
     def _update_db(self):
+        st = ss.manifest_db_status()
+        if st["downloaded"]:
+            msg = (f"This will re-download the Ludusavi manifest from GitHub "
+                   f"(several MB) and rebuild the search index "
+                   f"(currently {st['game_count']:,} games).\n\n"
+                   f"Continue?")
+        else:
+            msg = ("This will download the Ludusavi manifest from GitHub "
+                   "(several MB) and build the search index.\n\n"
+                   "Continue?")
+        if not self._confirm("Download / Update Database", msg):
+            return
         dlg = LudusaviDbDialog(mode="update", parent=self._main_win)
         dlg.exec()
+        self._refresh_db_status()
 
     def _rebuild_index(self):
+        if not ss.MANIFEST_FILE.exists():
+            QMessageBox.warning(
+                self, "No manifest",
+                "No local manifest found. Use 'Download / Update' first."
+            )
+            return
+        st = ss.manifest_db_status()
+        msg = (f"This will re-parse the local manifest and rebuild the "
+               f"search index"
+               + (f" (currently {st['game_count']:,} games)" if st['indexed'] else "")
+               + ".\n\nContinue?")
+        if not self._confirm("Rebuild Index", msg):
+            return
         dlg = LudusaviDbDialog(mode="rebuild", parent=self._main_win)
         dlg.exec()
+        self._refresh_db_status()
 
     def _db_search_exec(self):
         q = self._db_search.text().strip()

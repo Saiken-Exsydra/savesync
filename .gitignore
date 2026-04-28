@@ -1,6 +1,6 @@
 # Personal config — contains your local paths and game list
 savesync_config.json
-
+dist/
 # Google Drive credentials — never share these
 gdrive_credentials.json
 gdrive_token.json

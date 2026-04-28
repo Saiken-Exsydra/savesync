@@ -69,10 +69,25 @@ if not exist "gdrive_credentials.json" (
     echo          Google Drive features will NOT work without it.
     echo.
 )
+:: ── Bake Ludusavi database into the build ────────────────────
+:: Download manifest + build search index now so they get bundled
+:: into the exe and the user has the DB available on first launch.
+echo Preparing Ludusavi database for bundling...
+python _bake_ludusavi_db.py
+if %errorlevel% neq 0 (
+    echo WARNING: Could not prepare Ludusavi database — build will continue
+    echo          without bundling it. Users will need to download it manually.
+    echo.
+)
 if not exist "ludusavi_manifest.yaml" (
-    echo NOTE: ludusavi_manifest.yaml not found.
-    echo       Game-path auto-detection will be limited in the built exe.
-    echo       Download it via Settings ^> Download Database first.
+    echo NOTE: ludusavi_manifest.yaml still missing — exe will not include the DB.
+    echo.
+) else (
+    if exist "ludusavi_index.json" (
+        echo Ludusavi DB ready ^(manifest + index will be bundled^).
+    ) else (
+        echo NOTE: ludusavi_index.json missing — only the raw manifest will be bundled.
+    )
     echo.
 )
 

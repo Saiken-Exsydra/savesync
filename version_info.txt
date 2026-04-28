@@ -1,0 +1,41 @@
+# UTF-8
+#
+# PyInstaller version-info resource for SaveSync.exe
+# Edit the four numbers in `filevers` / `prodvers` (must be 4-tuples of ints)
+# and the matching strings in StringStruct(...) below to bump the version.
+#
+# Reference: https://pyinstaller.org/en/stable/spec-files.html#using-windows-version-resource
+
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(1, 0, 0, 0),
+    prodvers=(1, 0, 0, 0),
+    mask=0x3F,
+    flags=0x0,
+    OS=0x40004,         # VOS_NT_WINDOWS32
+    fileType=0x1,       # VFT_APP
+    subtype=0x0,
+    date=(0, 0),
+  ),
+  kids=[
+    StringFileInfo(
+      [
+        StringTable(
+          u'040904B0',  # Lang=0x0409 (en-US), CP=0x04B0 (Unicode)
+          [
+            StringStruct(u'CompanyName',      u'Breno Antonio Okok'),
+            StringStruct(u'FileDescription',  u'SaveSync — Game Save Backup Manager'),
+            StringStruct(u'FileVersion',      u'1.0.0.0'),
+            StringStruct(u'InternalName',     u'SaveSync'),
+            StringStruct(u'LegalCopyright',   u'© 2026 Breno Antonio Okok. All rights reserved.'),
+            StringStruct(u'OriginalFilename', u'SaveSync.exe'),
+            StringStruct(u'ProductName',      u'SaveSync'),
+            StringStruct(u'ProductVersion',   u'1.0.0.0'),
+            StringStruct(u'Comments',         u'Indie game save backup manager with Google Drive sync and 7z archives.'),
+          ]
+        )
+      ]
+    ),
+    VarFileInfo([VarStruct(u'Translation', [0x0409, 1200])])
+  ]
+)

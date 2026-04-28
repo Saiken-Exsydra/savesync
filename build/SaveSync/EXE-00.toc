@@ -3,7 +3,7 @@
  False,
  True,
  ["C:\\Users\\Ksy'luer\\Desktop\\SaveSync\\Savesync\\savesync.ico"],
- None,
+ versioninfo.VSVersionInfo(ffi=versioninfo.FixedFileInfo(filevers=(1, 0, 0, 0), prodvers=(1, 0, 0, 0), mask=0x3f, flags=0x0, OS=0x40004, fileType=1, subtype=0x0, date=(0, 0)), kids=[versioninfo.StringFileInfo([versioninfo.StringTable('040904B0', [versioninfo.StringStruct('CompanyName', 'Breno Antonio Okok'), versioninfo.StringStruct('FileDescription', 'SaveSync — Game Save Backup Manager'), versioninfo.StringStruct('FileVersion', '1.0.0.0'), versioninfo.StringStruct('InternalName', 'SaveSync'), versioninfo.StringStruct('LegalCopyright', '© 2026 Breno Antonio Okok. All rights reserved.'), versioninfo.StringStruct('OriginalFilename', 'SaveSync.exe'), versioninfo.StringStruct('ProductName', 'SaveSync'), versioninfo.StringStruct('ProductVersion', '1.0.0.0'), versioninfo.StringStruct('Comments', 'Indie game save backup manager with Google Drive sync and 7z archives.')])]), versioninfo.VarFileInfo([versioninfo.VarStruct('Translation', [1033, 1200])])]),
  False,
  False,
  b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<assembly xmlns='
@@ -76,7 +76,7 @@
  [],
  False,
  False,
- 1777089637,
+ 1777389342,
  [('runw.exe',
    "C:\\Users\\Ksy'luer\\AppData\\Local\\Programs\\Python\\Python314\\Lib\\site-packages\\PyInstaller\\bootloader\\Windows-64bit-intel\\runw.exe",
    'EXECUTABLE')],

@@ -64,6 +64,34 @@ MANIFEST_FILE  = BASE_DIR / "ludusavi_manifest.yaml"
 MANIFEST_INDEX = BASE_DIR / "ludusavi_index.json"
 MANIFEST_META  = BASE_DIR / "ludusavi_meta.json"
 
+# When running as a frozen exe, seed the writable manifest/index from the
+# read-only bundled copy on first run so users get the database out-of-the-box.
+if getattr(sys, "frozen", False):
+    _bundled_dir = Path(sys._MEIPASS)
+    for _src_name, _dst in (
+        ("ludusavi_manifest.yaml", MANIFEST_FILE),
+        ("ludusavi_index.json",    MANIFEST_INDEX),
+    ):
+        _src = _bundled_dir / _src_name
+        if _src.exists() and not _dst.exists():
+            try:
+                shutil.copy2(_src, _dst)
+            except Exception:
+                pass
+    if MANIFEST_FILE.exists() and not MANIFEST_META.exists():
+        try:
+            MANIFEST_META.write_text(
+                json.dumps({
+                    "downloaded_at":     "1970-01-01T00:00:00Z",
+                    "last_update_check": "1970-01-01T00:00:00Z",
+                    "update_available":  False,
+                    "bundled":           True,
+                }, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-7s  %(message)s",
@@ -358,6 +386,10 @@ def manifest_db_age() -> str:
         return "not downloaded"
     try:
         meta = json.loads(MANIFEST_META.read_text(encoding="utf-8"))
+        if meta.get("bundled"):
+            # Seeded from the bundled copy — true age is unknown until the
+            # remote update check fills it in.
+            return "bundled with app"
         ts   = meta.get("downloaded_at", "")
         dt   = datetime.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")
         age  = datetime.datetime.utcnow() - dt
@@ -370,6 +402,42 @@ def manifest_db_age() -> str:
             return f"{days} days old"
     except Exception:
         return "unknown age"
+
+
+def manifest_db_status() -> dict:
+    """Rich status of the local Ludusavi DB. Keys:
+        downloaded (bool), indexed (bool), game_count (int),
+        age (str), update_available (bool), checked_today (bool).
+    Pure local read — never touches the network.
+    """
+    out = {
+        "downloaded":       MANIFEST_FILE.exists(),
+        "indexed":          MANIFEST_INDEX.exists(),
+        "game_count":       0,
+        "age":              manifest_db_age(),
+        "update_available": False,
+        "checked_today":    False,
+    }
+    if out["indexed"]:
+        try:
+            out["game_count"] = len(json.loads(
+                MANIFEST_INDEX.read_text(encoding="utf-8")
+            ))
+        except Exception:
+            out["indexed"] = False
+    if MANIFEST_META.exists():
+        try:
+            meta = json.loads(MANIFEST_META.read_text(encoding="utf-8"))
+            out["update_available"] = bool(meta.get("update_available", False))
+            last = meta.get("last_update_check", "")
+            if last:
+                dt = datetime.datetime.strptime(last, "%Y-%m-%dT%H:%M:%SZ")
+                out["checked_today"] = (
+                    dt.date() == datetime.datetime.utcnow().date()
+                )
+        except Exception:
+            pass
+    return out
 
 
 def _load_manifest_meta() -> dict:
